@@ -1,0 +1,3 @@
+ # Core
+django>=5.1
+djangorestframework

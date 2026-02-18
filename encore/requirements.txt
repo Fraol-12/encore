@@ -1,6 +1,7 @@
- # Core
-django>=5.1
-djangorestframework
-django>=5.2,<5.3          # Lock to 5.2 series for LTS stability
-djangorestframework       # latest is fine
-django-environ 
+asgiref==3.11.1
+Django==5.2.11
+django-environ==0.12.0
+djangorestframework==3.16.1
+djangorestframework_simplejwt==5.5.1
+PyJWT==2.11.0
+sqlparse==0.5.5

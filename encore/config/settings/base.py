@@ -24,7 +24,9 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     
-    'rest_framework',          # DRF
+    'rest_framework',
+    'apps.playlists.apps.PlaylistsConfig',    
+    'apps.users.apps.UsersConfig',     
 ]
 
 MIDDLEWARE = [

@@ -8,6 +8,8 @@ env = environ.Env()
 # Explicit path to .env
 environ.Env.read_env(BASE_DIR / ".env")
 
+AUTH_USER_MODEL = 'users.CustomUser' 
+
 SECRET_KEY = env("SECRET_KEY")
 
 DEBUG = env.bool("DEBUG", default=False)

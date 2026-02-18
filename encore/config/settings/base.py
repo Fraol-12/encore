@@ -1,6 +1,8 @@
 import environ
 from pathlib import Path
 
+from datetime import timedelta
+
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 env = environ.Env()
@@ -30,6 +32,32 @@ INSTALLED_APPS = [
     'apps.playlists.apps.PlaylistsConfig',    
     'apps.users.apps.UsersConfig',     
 ]
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',  # default to authenticated
+    ),
+}
+
+# Simple JWT settings
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),      # short-lived access tokens
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),         # longer refresh
+    'ROTATE_REFRESH_TOKENS': True,                       # issue new refresh on use
+    'BLACKLIST_AFTER_ROTATION': True,                    # blacklist old refresh tokens
+
+    'AUTH_HEADER_TYPES': ('Bearer',),
+    'AUTH_HEADER_NAME': 'HTTP_AUTHORIZATION',
+
+    'USER_ID_FIELD': 'id',
+    'USER_ID_CLAIM': 'user_id',
+
+    # Optional: stronger signing
+    'SIGNING_KEY': SECRET_KEY,  # uses Django's SECRET_KEY
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',

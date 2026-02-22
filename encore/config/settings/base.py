@@ -114,3 +114,8 @@ USE_TZ = True
 STATIC_URL = 'static/'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+YOUTUBE_API_KEY = env('YOUTUBE_API_KEY', default=None)
+
+if not YOUTUBE_API_KEY:
+    raise ImproperlyConfigured("YOUTUBE_API_KEY is required") 

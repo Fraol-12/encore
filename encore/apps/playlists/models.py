@@ -41,7 +41,7 @@ class Playlist(models.Model):
         default='idle',
         choices=[
             ('idle', 'Idle'),
-            ('queued', 'Queued'),
+            ('queued', 'Queued'), 
             ('syncing', 'Syncing'),
             ('partial', 'Partial Success'),
             ('failed', 'Failed'),
@@ -63,6 +63,19 @@ class Playlist(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    youtube_channel_id = models.CharField(max_length=100, blank=True, null=True)
+    youtube_channel_title = models.CharField(max_length=255, blank=True)
+    youtube_item_count = models.PositiveIntegerField(default=0, editable=False)
+    youtube_thumbnail_url = models.URLField(max_length=500, blank=True, null=True) 
+    youtube_published_at = models.DateTimeField(null=True, blank=True)
+    youtube_last_fetched_at = models.DateTimeField(null=True, blank=True)
+    youtube_privacy_status = models.CharField(
+        max_length=20,
+        choices=[('public', 'Public'), ('private', 'Private'), ('unlisted', 'Unlisted')],
+        blank=True
+    )
+
 
     class Meta:
         ordering = ['-created_at']

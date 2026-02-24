@@ -1,15 +1,24 @@
-from rest_framework import viewsets
+from rest_framework import viewsets, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.exceptions import ValidationError
+from django.core.exceptions import ValidationError
+from django.utils import timezone
+from rest_framework.generics import RetrieveAPIView
 
-from .models import Playlist, PlaylistItem, SyncOperation
-from .serializers import PlaylistSerializer, PlaylistItemSerializer
+from .models import Playlist, SyncOperation
+from .serializers import PlaylistSerializer, PlaylistItemSerializer, SyncOperationSerializer
 from apps.users.permissions import IsOwner
 from .services.youtube_service import YouTubeService 
 
+
+class SyncOperationDetailView(RetrieveAPIView):
+    queryset = SyncOperation.objects.all()
+    serializer_class = SyncOperationSerializer
+    permission_classes = [IsAuthenticated, IsOwner]  # reuse ownership
+
+    def get_queryset(self):
+        return SyncOperation.objects.filter(playlist__user=self.request.user)
 
 class PlaylistViewSet(viewsets.ModelViewSet):
     queryset = Playlist.objects.all()
@@ -23,11 +32,28 @@ class PlaylistViewSet(viewsets.ModelViewSet):
         """
         return self.queryset.filter(user=self.request.user)
 
-    def perform_create(self, serializer):
-        """
-        Automatically assign the authenticated user as owner on create.
-        """
-        serializer.save(user=self.request.user)
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        youtube_id = serializer.validated_data.get('youtube_playlist_id')
+        if not youtube_id:
+            return Response(
+                {"youtube_playlist_id": ["This field is required."]},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            service = YouTubeService()
+            playlist = service.create_from_youtube(
+                user=request.user,
+                youtube_playlist_id=youtube_id
+            )
+            # No need to call perform_create — service already sets user
+            return Response(self.get_serializer(playlist).data, status=status.HTTP_201_CREATED)
+
+        except ValidationError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['get'], url_path='items')
     def items(self, request, pk=None):
@@ -37,40 +63,30 @@ class PlaylistViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)  
     @action(detail=True, methods=['post'], url_path='sync')
     def sync(self, request, pk=None):
-        playlist = self.get_object() 
+        playlist = self.get_object()
 
         operation = SyncOperation.objects.create(
             playlist=playlist,
-            status='queued',
+            status='running',
             triggered_by='user'
         )
 
-        playlist.sync_status = 'queued'
-        playlist.save(update_fields=['sync_status'])
-
-        return Response({
-            'status':'queued',
-            'sync_operation_id': operation.id,
-            'message':'Sync queued. poll /api/sync-operations/{id}/for status.'
-        }, status=202)
-    
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        youtube_id = serializer.validated_data.get('youtube_playlist_id')
-        if not youtube_id:
-            raise ValidationError({"youtube_playlist_id": "This field is required."})
-        
         try:
             service = YouTubeService()
-            playlist = service.create_from_youtube(
-                user=request.user,
-                youtube_playlist_id=youtube_id 
-            )
-            return Response(self.get_serializer(playlist).data, status=status.HTTP_201_CREATED)
-        except ValidationError as e:
-            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            result = service.resync_playlist(playlist)
 
-    
+            operation.status = result['status']
+            operation.matched_count = result['total_now']
+            operation.added_count = result['added']  # add this field to model if needed
+            operation.ended_at = timezone.now()
+            operation.save()
+
+            return Response(result, status=200)
+
+        except Exception as e:
+            operation.status = 'failed'
+            operation.errors = {'error': str(e)}
+            operation.ended_at = timezone.now()
+            operation.save()
+            return Response({'detail': str(e)}, status=400)
         

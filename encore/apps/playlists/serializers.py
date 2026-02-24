@@ -1,7 +1,7 @@
 from rest_framework import serializers
-from .models import Playlist, PlaylistItem
+from .models import Playlist, PlaylistItem, SyncOperation
 
-Playlist
+
 class PlaylistSerializer(serializers.ModelSerializer):
     class Meta:
         model = Playlist
@@ -33,4 +33,17 @@ class PlaylistItemSerializer(serializers.ModelSerializer):
             'duration_seconds', 'thumbnail_url', 'position',
             'is_removed_from_source', 'added_at'
         ]
-        read_only_fields = fields 
+        read_only_fields = [
+            'id', 'youtube_video_id', 'title', 'channel_title',
+            'duration_seconds', 'thumbnail_url', 'position',
+            'is_removed_from_source', 'added_at'
+        ]
+        
+class SyncOperationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SyncOperation
+        fields = [
+            'id', 'status', 'matched_count', 'unmatched_count', 'error_count',
+            'errors', 'started_at', 'ended_at', 'triggered_by'
+        ]
+        read_only_fields = fields        

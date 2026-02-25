@@ -6,7 +6,7 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 from rest_framework.generics import RetrieveAPIView
 from django.db import transaction
-
+from .tasks import process_sync
 
 from .models import Playlist, SyncOperation
 from .serializers import PlaylistSerializer, PlaylistItemSerializer, SyncOperationSerializer
@@ -68,63 +68,28 @@ class PlaylistViewSet(viewsets.ModelViewSet):
     def sync(self, request, pk=None):
         playlist = self.get_object()
 
-        # Idempotency / concurrency check
         active_sync = SyncOperation.objects.filter(
             playlist=playlist,
             status__in=['queued', 'running']
         ).exists()
 
         if active_sync:
-            return Response(
-                {"detail": "A sync is already queued or running for this playlist."},
-                status=status.HTTP_409_CONFLICT
-            )
+            return Response({"detail": "Sync already in progress."}, status=409)
 
-        # Create new operation
         operation = SyncOperation.objects.create(
             playlist=playlist,
-            status='running',
-            triggered_by='user',
-            started_at=timezone.now()
+            status='queued',
+            triggered_by='user'
         )
 
-        try:
-            with transaction.atomic():
-                # Clean slate: delete unmatched/unconfirmed items (optional - adjust policy)
-                # PlaylistItem.objects.filter(playlist=playlist, trackmatch__isnull=True).delete()
+        process_sync.delay(operation.id)  # ← queue the task
 
-                # Real work placeholder (replace with YouTube fetch later)
-                # For now: simulate work
-                # service = YouTubeService()
-                # service.import_playlist_items(playlist)
+        playlist.sync_status = 'queued'
+        playlist.save(update_fields=['sync_status'])
 
-                # Mark success (stub)
-                operation.status = 'completed'
-                operation.ended_at = timezone.now()
-                operation.save()
-
-                playlist.sync_status = 'completed'
-                playlist.save(update_fields=['sync_status'])
-
-            return Response({
-                'status': operation.status,
-                'sync_operation_id': operation.id,
-                'message': 'Sync completed successfully.'
-            }, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            # Rollback is automatic via transaction
-            operation.status = 'failed'
-            operation.errors = {"error": str(e)}
-            operation.ended_at = timezone.now()
-            operation.save()
-
-            playlist.sync_status = 'failed'
-            playlist.save(update_fields=['sync_status'])
-
-            return Response({
-                'status': 'failed',
-                'sync_operation_id': operation.id,
-                'message': f'Sync failed: {str(e)}'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
+        return Response({
+            'status': 'queued',
+            'sync_operation_id': operation.id,
+            'message': 'Sync queued. Poll /api/sync-operations/{id}/'.format(id=operation.id)
+        }, status=202)
+            

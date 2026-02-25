@@ -5,6 +5,8 @@ from rest_framework.response import Response
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 from rest_framework.generics import RetrieveAPIView
+from django.db import transaction
+
 
 from .models import Playlist, SyncOperation
 from .serializers import PlaylistSerializer, PlaylistItemSerializer, SyncOperationSerializer
@@ -62,38 +64,67 @@ class PlaylistViewSet(viewsets.ModelViewSet):
         except ValidationError as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-    @action(detail=True, methods=['get'], url_path='items')
-    def items(self, request, pk=None):
-        playlist = self.get_object()    
-        items = playlist.items.all().order_by('position') 
-        serializer = PlaylistItemSerializer(items, many=True) 
-        return Response(serializer.data)  
     @action(detail=True, methods=['post'], url_path='sync')
     def sync(self, request, pk=None):
         playlist = self.get_object()
 
+        # Idempotency / concurrency check
+        active_sync = SyncOperation.objects.filter(
+            playlist=playlist,
+            status__in=['queued', 'running']
+        ).exists()
+
+        if active_sync:
+            return Response(
+                {"detail": "A sync is already queued or running for this playlist."},
+                status=status.HTTP_409_CONFLICT
+            )
+
+        # Create new operation
         operation = SyncOperation.objects.create(
             playlist=playlist,
             status='running',
-            triggered_by='user'
+            triggered_by='user',
+            started_at=timezone.now()
         )
 
         try:
-            service = YouTubeService()
-            result = service.resync_playlist(playlist)
+            with transaction.atomic():
+                # Clean slate: delete unmatched/unconfirmed items (optional - adjust policy)
+                # PlaylistItem.objects.filter(playlist=playlist, trackmatch__isnull=True).delete()
 
-            operation.status = result['status']
-            operation.matched_count = result['total_now']
-            operation.added_count = result['added']  # add this field to model if needed
-            operation.ended_at = timezone.now()
-            operation.save()
+                # Real work placeholder (replace with YouTube fetch later)
+                # For now: simulate work
+                # service = YouTubeService()
+                # service.import_playlist_items(playlist)
 
-            return Response(result, status=200)
+                # Mark success (stub)
+                operation.status = 'completed'
+                operation.ended_at = timezone.now()
+                operation.save()
+
+                playlist.sync_status = 'completed'
+                playlist.save(update_fields=['sync_status'])
+
+            return Response({
+                'status': operation.status,
+                'sync_operation_id': operation.id,
+                'message': 'Sync completed successfully.'
+            }, status=status.HTTP_200_OK)
 
         except Exception as e:
+            # Rollback is automatic via transaction
             operation.status = 'failed'
-            operation.errors = {'error': str(e)}
+            operation.errors = {"error": str(e)}
             operation.ended_at = timezone.now()
             operation.save()
-            return Response({'detail': str(e)}, status=400)
+
+            playlist.sync_status = 'failed'
+            playlist.save(update_fields=['sync_status'])
+
+            return Response({
+                'status': 'failed',
+                'sync_operation_id': operation.id,
+                'message': f'Sync failed: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         

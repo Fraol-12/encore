@@ -40,10 +40,21 @@ class PlaylistItemSerializer(serializers.ModelSerializer):
         ]
         
 class SyncOperationSerializer(serializers.ModelSerializer):
+    """
+    Exposes sync operation status and results.
+    Errors are JSON — client can parse for per-item failures.
+    """
     class Meta:
         model = SyncOperation
         fields = [
-            'id', 'status', 'matched_count', 'unmatched_count', 'error_count',
-            'errors', 'started_at', 'ended_at', 'triggered_by'
+            'id',
+            'status',
+            'matched_count',
+            'unmatched_count',
+            'error_count',
+            'errors',                # JSON dict or list of failures
+            'started_at',
+            'ended_at',
+            'triggered_by',
         ]
-        read_only_fields = fields        
+        read_only_fields = fields  # client cannot change these        

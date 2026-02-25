@@ -13,11 +13,18 @@ from .services.youtube_service import YouTubeService
 
 
 class SyncOperationDetailView(RetrieveAPIView):
+    """
+    Allows the playlist owner to check the status of a sync operation.
+    """
     queryset = SyncOperation.objects.all()
     serializer_class = SyncOperationSerializer
-    permission_classes = [IsAuthenticated, IsOwner]  # reuse ownership
+    permission_classes = [IsAuthenticated, IsOwner]
+    lookup_field = 'pk'  # default, but explicit is good
 
     def get_queryset(self):
+        """
+        Only allow access to sync operations belonging to the current user's playlists.
+        """
         return SyncOperation.objects.filter(playlist__user=self.request.user)
 
 class PlaylistViewSet(viewsets.ModelViewSet):

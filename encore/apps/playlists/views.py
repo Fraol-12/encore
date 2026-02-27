@@ -93,3 +93,9 @@ class PlaylistViewSet(viewsets.ModelViewSet):
             'message': 'Sync queued. Poll /api/sync-operations/{id}/'.format(id=operation.id)
         }, status=202)
             
+    @action(detail=True, methods=['get'], url_path='items')
+    def items(self, request, pk=None):
+        playlist = self.get_object()
+        items = playlist.items.order_by('position')  # or .all()
+        serializer = PlaylistItemSerializer(items, many=True)
+        return Response(serializer.data)

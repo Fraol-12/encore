@@ -23,4 +23,4 @@ urlpatterns = [
     
     path('api/', include(router.urls)), 
     path('api/sync-operations/<int:pk>/', SyncOperationDetailView.as_view(), name='sync-operation-detail'),
-]
+] 

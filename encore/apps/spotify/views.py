@@ -102,3 +102,19 @@ class SpotifyCallbackView(APIView):
             'message': 'Spotify linked',
             'spotify_user_id': me['id']
         }, status=200)
+    
+class SpotifyStatusView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        try:
+            account = request.user.spotify_account
+            return Response({
+                'linked': True,
+                'spotify_user_id': account.spotify_user_id,
+                'expires_at': account.expires_at,
+                'is_active': account.is_active,
+                'last_updated': account.updated_at
+            })
+        except SpotifyAccount.DoesNotExist:
+            return Response({'linked': False})    

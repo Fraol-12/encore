@@ -58,23 +58,24 @@ class YouTubeService:
     @transaction.atomic
     def import_playlist_items(self, playlist: Playlist):
         """
-        Fetch all items from the YouTube playlist and store them as PlaylistItem.
-        Uses bulk_create for performance. Transactional — all or nothing.
+        Fetch ALL items from the YouTube playlist (handles pagination).
+        Stores as PlaylistItem objects.
+        Uses bulk_create for performance.
+        Transactional — all or nothing.
         """
         if not playlist.youtube_playlist_id:
-            return
+            return 0  # nothing to do
 
-        items = []
-        video_ids = [] 
+        items_to_create = []
         next_page_token = None
-        fetched_count = 0
+        total_fetched = 0
 
         while True:
             try:
                 response = self.client.playlistItems().list(
                     part='snippet,contentDetails',
                     playlistId=playlist.youtube_playlist_id,
-                    maxResults=50,
+                    maxResults=50,               # max allowed per page
                     pageToken=next_page_token
                 ).execute()
 
@@ -82,58 +83,51 @@ class YouTubeService:
                     snippet = yt_item['snippet']
                     content = yt_item['contentDetails']
 
-                    video_id = content['videoId'] 
-                    items.append(PlaylistItem(
+                    # Skip deleted/unavailable videos (YouTube sometimes returns them)
+                    if content.get('videoId') is None:
+                        continue
+
+                    items_to_create.append(PlaylistItem(
                         playlist=playlist,
                         youtube_video_id=content['videoId'],
                         title=snippet['title'],
                         channel_title=snippet['channelTitle'],
                         position=snippet['position'],
-                        thumbnail_url=snippet['thumbnails'].get('high', {}).get('url'),
-                        duration_seconds=None,  # optional: fetch later via videos.list
+                        thumbnail_url=snippet.get('thumbnails', {}).get('high', {}).get('url'),
+                        duration_seconds=None,  # we'll fetch later or leave null for now
                         added_at=timezone.now(),
                     ))
-                    video_ids.append(video_id)
-                    fetched_count += 1
+                    total_fetched += 1
 
                 next_page_token = response.get('nextPageToken')
-                if not next_page_token or fetched_count >= 500:
+                if not next_page_token:
                     break
-            
+
             except HttpError as e:
+                if e.resp.status in (403, 429):
+                    raise ValidationError("YouTube API quota exceeded or rate limited. Try again later.")
                 raise ValidationError(f"Failed to fetch playlist items: {str(e)}")
-            
-        if video_ids:
-            try:
-                for i in range(0, len(video_ids), 50):
-                    batch_ids = video_ids[i:i+50]
-                    vid_response = self.client.videos().list(
-                        part='contentDetails',
-                        id=','.join(batch_ids)
-                    ).execute() 
 
-                    for vid_item in vid_response.get('items', []):
-                        video_id = vid_item['id'] 
-                        duration_iso = vid_item['contentDetails'].get('duration')
-                        if duration_iso:
-                                # Parse ISO 8601 duration (e.g. PT3M45S → 225 seconds)
-                            duration = self._parse_iso_duration(duration_iso)
-                            # Find matching PlaylistItem and set duration
-                            for item in items:
-                                if item.youtube_video_id == video_id:
-                                    item.duration_seconds = duration
-                                    break
-            except HttpError as e:
-                # Don't fail whole import — log and continue
-                print(f"Duration fetch failed: {e}")  # replace with logging later                    
+        if items_to_create:
+            # Idempotent: skip already existing video IDs in this playlist
+            existing_ids = set(
+                PlaylistItem.objects.filter(playlist=playlist)
+                .values_list('youtube_video_id', flat=True)
+            )
 
-        if items:
-            PlaylistItem.objects.bulk_create(items, ignore_conflicts=True)
+            new_items = [
+                item for item in items_to_create
+                if item.youtube_video_id not in existing_ids
+            ]
 
-            # Update playlist metadata after successful import
-            playlist.youtube_item_count = fetched_count
-            playlist.youtube_last_fetched_at = timezone.now()
-            playlist.save(update_fields=['youtube_item_count', 'youtube_last_fetched_at'])
+            PlaylistItem.objects.bulk_create(new_items, ignore_conflicts=True)
+
+        # Update count and timestamp
+        playlist.youtube_item_count = PlaylistItem.objects.filter(playlist=playlist).count()
+        playlist.youtube_last_fetched_at = timezone.now()
+        playlist.save(update_fields=['youtube_item_count', 'youtube_last_fetched_at'])
+
+        return total_fetched
 
     def create_from_youtube(self, user, youtube_playlist_id: str) -> Playlist:
         """

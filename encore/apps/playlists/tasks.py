@@ -15,9 +15,10 @@ def process_sync(sync_operation_id: int):
 
     try:
         service = YouTubeService()
-        service.import_playlist_items(playlist)
+        added = service.import_playlist_items(playlist)
 
         operation.status = 'completed'
+        operation.matched_count = added  # for now; later real matches
         operation.ended_at = timezone.now()
         operation.save()
 

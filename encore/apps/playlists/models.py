@@ -2,7 +2,6 @@ from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator
 
-
 class Playlist(models.Model):
     """
     Represents a logical playlist owned by a user.
@@ -34,6 +33,19 @@ class Playlist(models.Model):
         blank=True,
         null=True,
         help_text="spotify:playlist:... URI"
+    )
+
+    SYNC_MODES = [
+        ('append_only', 'Append Only (add missing, never remove)'),
+        ('smart_diff', 'Smart Diff (add/remove based on source, preserve manual changes)'),
+        ('full_replace', 'Full Replace (mirror source exactly – destructive)'),
+    ]
+
+    sync_mode = models.CharField(
+        max_length=20,
+        choices=SYNC_MODES,
+        default='smart_diff',
+        help_text="How to handle re-syncs"
     )
 
     sync_status = models.CharField(

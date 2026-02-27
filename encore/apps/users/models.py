@@ -5,7 +5,7 @@ from django.utils.translation import gettext_lazy as _
 from encrypted_model_fields.fields import EncryptedCharField 
 from datetime import timedelta 
 import requests 
-
+from django.conf import settings
 
 class CustomUserManager(BaseUserManager):
     """
@@ -108,9 +108,16 @@ class SpotifyAccount(models.Model):
         verbose_name = "Spotify Account"
         verbose_name_plural = "Spotify Accounts"  
 
-    def refresh_access_token(self):
+    def is_expired(self, buffer_minutes=5):
+        """Check if access token is expired (with buffer to avoid edge race)."""
+        if not self.expires_at:
+            return True
+        return timezone.now() >= (self.expires_at - timedelta(minutes=buffer_minutes))
+
+    def refresh(self):
+        """Refresh access token using refresh_token."""
         if not self.refresh_token:
-            raise ValueError("No refresh token available — user must re-authenticate")
+            raise ValueError("No refresh token — user must re-authenticate")
 
         payload = {
             'grant_type': 'refresh_token',
@@ -120,22 +127,24 @@ class SpotifyAccount(models.Model):
         }
 
         try:
-            response = requests.post(settings.SPOTIFY_TOKEN_URL, data=payload)
-            response.raise_for_status()
-            tokens = response.json()
+            resp = requests.post(settings.SPOTIFY_TOKEN_URL, data=payload, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
 
-            self.access_token = tokens['access_token']
-            self.expires_at = timezone.now() + timedelta(seconds=tokens['expires_in'])
-            if 'refresh_token' in tokens:  # sometimes Spotify rotates it
-                self.refresh_token = tokens['refresh_token']
-            self.scope = tokens.get('scope', self.scope)
-            self.save()
+            self.access_token = data['access_token']
+            self.expires_at = timezone.now() + timedelta(seconds=data['expires_in'])
 
-            print(f"Refreshed token for {self.user.email} — new expiry: {self.expires_at}")
-            return True
+            # Spotify sometimes rotates refresh_token — update if provided
+            if 'refresh_token' in data:
+                self.refresh_token = data['refresh_token']
+
+            self.scope = data.get('scope', self.scope)
+            self.save(update_fields=['access_token', 'refresh_token', 'expires_at', 'scope'])
+
+            print(f"Refreshed token for user {self.user.email} — new expiry: {self.expires_at}")
 
         except requests.RequestException as e:
             print(f"Refresh failed for {self.user.email}: {str(e)}")
             self.is_active = False
-            self.save()
-            raise RuntimeError(f"Spotify refresh failed: {str(e)}")      
+            self.save(update_fields=['is_active'])
+            raise RuntimeError(f"Spotify token refresh failed: {str(e)}")

@@ -2,7 +2,7 @@ from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, Permis
 from django.db import models
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
-
+from encrypted_model_fields.fields import EncryptedCharField
 
 class CustomUserManager(BaseUserManager):
     """
@@ -80,3 +80,27 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
 
     def get_short_name(self):
         return self.email
+    
+class SpotifyAccount(models.Model):
+    user = models.OneToOneField(
+        'CustomUser',
+        on_delete=models.CASCADE,
+        related_name='spotify_account'
+    )
+
+    spotify_user_id = models.CharField(max_length=100, blank=True)  # from /me
+    access_token = EncryptedCharField(max_length=500)
+    refresh_token = EncryptedCharField(max_length=500, blank=True, null=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    scope = models.TextField(blank=True)  # space-separated scopes
+    is_active = models.BooleanField(default=True)  # false if revoked
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Spotify for {self.user.email}"
+
+    class Meta:
+        verbose_name = "Spotify Account"
+        verbose_name_plural = "Spotify Accounts"    

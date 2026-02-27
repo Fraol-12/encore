@@ -126,3 +126,12 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'UTC'
+FIELD_ENCRYPTION_KEY = env("FIELD_ENCRYPTION_KEY")
+
+SPOTIFY_CLIENT_ID = env('SPOTIFY_CLIENT_ID')
+SPOTIFY_CLIENT_SECRET = env('SPOTIFY_CLIENT_SECRET')
+SPOTIFY_REDIRECT_URI = env('SPOTIFY_REDIRECT_URI', default='http://127.0.0.1:8000/api/spotify/callback/')
+
+SPOTIFY_AUTH_URL = 'https://accounts.spotify.com/authorize'
+SPOTIFY_TOKEN_URL = 'https://accounts.spotify.com/api/token'
+SPOTIFY_SCOPES = 'playlist-modify-public playlist-modify-private playlist-read-private user-read-private'

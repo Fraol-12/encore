@@ -47,6 +47,13 @@ REST_FRAMEWORK = {
     'MAX_PAGE_SIZE': 100,                     # prevent abuse
 }
 
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'unique-snowflake',
+    }
+}
+
 # Simple JWT settings
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),      # short-lived access tokens
@@ -135,3 +142,11 @@ SPOTIFY_REDIRECT_URI = env('SPOTIFY_REDIRECT_URI', default='http://127.0.0.1:800
 SPOTIFY_AUTH_URL = 'https://accounts.spotify.com/authorize'
 SPOTIFY_TOKEN_URL = 'https://accounts.spotify.com/api/token'
 SPOTIFY_SCOPES = 'playlist-modify-public playlist-modify-private playlist-read-private user-read-private'
+
+
+# settings/local.py or base.py for dev
+SESSION_ENGINE = 'django.contrib.sessions.backends.signed_cookies'
+SESSION_COOKIE_NAME = 'encore_session'
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SECURE = False          # MUST be False for HTTP
+SESSION_COOKIE_SAMESITE = None         # Allow cross-site OAuth redirects

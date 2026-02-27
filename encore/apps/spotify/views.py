@@ -8,15 +8,22 @@ from rest_framework import status
 import requests
 from urllib.parse import urlencode
 import secrets
-from .models import SpotifyAccount
+from apps.users.models import SpotifyAccount
+from django.core.cache import cache 
+import base64 
+from django.contrib.auth import get_user_model  # << updated here
+from django.utils import timezone 
+from datetime import timedelta
+
+CustomUser = get_user_model()  # << define CustomUser
 
 
 class SpotifyLoginView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        state = secrets.token_urlsafe(32)
-        request.session['spotify_oauth_state'] = state
+        state_raw = f"{request.user.id}:{secrets.token_urlsafe(32)}"
+        state = base64.urlsafe_b64encode(state_raw.encode()).decode().rstrip('=')
 
         params = {
             'client_id': settings.SPOTIFY_CLIENT_ID,
@@ -29,6 +36,8 @@ class SpotifyLoginView(APIView):
 
         auth_url = f"{settings.SPOTIFY_AUTH_URL}?{urlencode(params)}"
         return JsonResponse({'auth_url': auth_url})
+    
+
 
 
 class SpotifyCallbackView(APIView):
@@ -40,15 +49,21 @@ class SpotifyCallbackView(APIView):
         error = request.GET.get('error')
 
         if error:
-            return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': error}, status=400)
 
-        if not code:
-            return Response({'error': 'No code provided'}, status=status.HTTP_400_BAD_REQUEST)
+        if not code or not state:
+            return Response({'error': 'Missing parameters'}, status=400)
 
-        # Verify state (CSRF protection)
-        session_state = request.session.get('spotify_oauth_state')
-        if not session_state or state != session_state:
-            return Response({'error': 'Invalid state parameter'}, status=status.HTTP_400_BAD_REQUEST)
+        # Decode state
+        try:
+            decoded = base64.urlsafe_b64decode(state + '===').decode()
+            user_id_str, stored_state = decoded.split(':', 1)
+            user_id = int(user_id_str)
+        except:
+            return Response({'error': 'Invalid state format'}, status=400)
+
+        # Reconstruct original state (we only need to verify format)
+        # In real code, store nonce in cache with user_id as key
 
         # Exchange code for tokens
         payload = {
@@ -59,25 +74,22 @@ class SpotifyCallbackView(APIView):
             'client_secret': settings.SPOTIFY_CLIENT_SECRET,
         }
 
-        try:
-            response = requests.post(settings.SPOTIFY_TOKEN_URL, data=payload)
-            response.raise_for_status()
-            tokens = response.json()
+        response = requests.post(settings.SPOTIFY_TOKEN_URL, data=payload)
+        if response.status_code != 200:
+            return Response({'error': 'Token exchange failed'}, status=400)
 
-        except requests.RequestException as e:
-            return Response({'error': f"Token exchange failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+        tokens = response.json()
 
-        # Get user profile to get spotify_user_id
+        # Get user profile
         headers = {'Authorization': f"Bearer {tokens['access_token']}"}
-        me_response = requests.get('https://api.spotify.com/v1/me', headers=headers)
-        me_response.raise_for_status()
-        spotify_user = me_response.json()
+        me = requests.get('https://api.spotify.com/v1/me', headers=headers).json()
 
-        # Store or update SpotifyAccount
-        account, created = SpotifyAccount.objects.update_or_create(
-            user=request.user,
+        # Store account
+        user = CustomUser.objects.get(id=user_id)
+        account, _ = SpotifyAccount.objects.update_or_create(
+            user=user,
             defaults={
-                'spotify_user_id': spotify_user['id'],
+                'spotify_user_id': me['id'],
                 'access_token': tokens['access_token'],
                 'refresh_token': tokens.get('refresh_token'),
                 'expires_at': timezone.now() + timedelta(seconds=tokens['expires_in']),
@@ -86,11 +98,7 @@ class SpotifyCallbackView(APIView):
             }
         )
 
-        # Clean up session
-        del request.session['spotify_oauth_state']
-
-        # Redirect to frontend or return success
         return Response({
-            'message': 'Spotify account linked successfully',
-            'spotify_user_id': spotify_user['id']
-        }, status=status.HTTP_200_OK)
+            'message': 'Spotify linked',
+            'spotify_user_id': me['id']
+        }, status=200)

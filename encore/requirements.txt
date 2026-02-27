@@ -46,3 +46,4 @@ wcwidth==0.6.0
 django-fernet-fields
 requests-oauthlib
 rapidfuzz
+django-encrypted-model-fields

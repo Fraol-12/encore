@@ -1,6 +1,8 @@
 from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator
+from django.db.models import Q 
+
 
 class Playlist(models.Model):
     """
@@ -256,10 +258,12 @@ class SyncOperation(models.Model):
     )
 
     class Meta:
-        ordering = ['-started_at']
-        indexes = [
-            models.Index(fields=['playlist', 'status']),
-            models.Index(fields=['started_at']),
+        constraints = [
+            models.UniqueConstraint(
+                fields=['playlist', 'status'],
+                condition=Q(status__in=['queued', 'running']),
+                name='unique_active_sync_per_playlist'
+            )
         ]
 
     def __str__(self):

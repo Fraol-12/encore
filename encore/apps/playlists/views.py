@@ -2,43 +2,31 @@ from rest_framework import viewsets, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.core.exceptions import ValidationError
-from django.utils import timezone
 from rest_framework.generics import RetrieveAPIView
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from .tasks import process_sync
-
 from .models import Playlist, SyncOperation
 from .serializers import PlaylistSerializer, PlaylistItemSerializer, SyncOperationSerializer
 from apps.users.permissions import IsOwner
-from .services.youtube_service import YouTubeService 
-
+from .services.youtube_service import YouTubeService
+from rest_framework.exceptions import ValidationError
+from django.core.exceptions import ValidationError
 
 class SyncOperationDetailView(RetrieveAPIView):
-    """
-    Allows the playlist owner to check the status of a sync operation.
-    """
     queryset = SyncOperation.objects.all()
     serializer_class = SyncOperationSerializer
     permission_classes = [IsAuthenticated, IsOwner]
-    lookup_field = 'pk'  # default, but explicit is good
 
     def get_queryset(self):
-        """
-        Only allow access to sync operations belonging to the current user's playlists.
-        """
         return SyncOperation.objects.filter(playlist__user=self.request.user)
+
 
 class PlaylistViewSet(viewsets.ModelViewSet):
     queryset = Playlist.objects.all()
     serializer_class = PlaylistSerializer
-
     permission_classes = [IsAuthenticated, IsOwner]
 
     def get_queryset(self):
-        """
-        Only return playlists owned by the authenticated user. 
-        """
         return self.queryset.filter(user=self.request.user)
 
     def create(self, request, *args, **kwargs):
@@ -58,9 +46,7 @@ class PlaylistViewSet(viewsets.ModelViewSet):
                 user=request.user,
                 youtube_playlist_id=youtube_id
             )
-            # No need to call perform_create — service already sets user
             return Response(self.get_serializer(playlist).data, status=status.HTTP_201_CREATED)
-
         except ValidationError as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -68,21 +54,33 @@ class PlaylistViewSet(viewsets.ModelViewSet):
     def sync(self, request, pk=None):
         playlist = self.get_object()
 
-        active_sync = SyncOperation.objects.filter(
+        print(f"[SYNC] User {request.user.email} triggered sync for playlist {playlist.id}")
+
+        active = SyncOperation.objects.filter(
             playlist=playlist,
             status__in=['queued', 'running']
-        ).exists()
-
-        if active_sync:
-            return Response({"detail": "Sync already in progress."}, status=409)
-
-        operation = SyncOperation.objects.create(
-            playlist=playlist,
-            status='queued',
-            triggered_by='user'
         )
 
-        process_sync.delay(operation.id)  # ← queue the task
+        if active.exists():
+            active_ids = list(active.values_list('id', flat=True))
+            return Response(
+                {"detail": f"Sync already queued/running (IDs: {active_ids})"},
+                status=status.HTTP_409_CONFLICT
+            )
+
+        try:
+            operation = SyncOperation.objects.create(
+                playlist=playlist,
+                status='queued',
+                triggered_by='user'
+            )
+        except IntegrityError:
+            return Response(
+                {"detail": "A sync is already queued or running for this playlist."},
+                status=status.HTTP_409_CONFLICT
+            )
+
+        process_sync.delay(operation.id)
 
         playlist.sync_status = 'queued'
         playlist.save(update_fields=['sync_status'])
@@ -90,12 +88,12 @@ class PlaylistViewSet(viewsets.ModelViewSet):
         return Response({
             'status': 'queued',
             'sync_operation_id': operation.id,
-            'message': 'Sync queued. Poll /api/sync-operations/{id}/'.format(id=operation.id)
-        }, status=202)
-            
+            'message': f'Sync queued. Poll /api/sync-operations/{operation.id}/'
+        }, status=status.HTTP_202_ACCEPTED)
+
     @action(detail=True, methods=['get'], url_path='items')
     def items(self, request, pk=None):
         playlist = self.get_object()
-        items = playlist.items.order_by('position')  # or .all()
+        items = playlist.items.order_by('position')
         serializer = PlaylistItemSerializer(items, many=True)
         return Response(serializer.data)

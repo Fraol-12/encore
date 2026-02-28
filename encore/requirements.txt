@@ -47,3 +47,4 @@ django-fernet-fields
 requests-oauthlib
 rapidfuzz
 django-encrypted-model-fields
+isodate

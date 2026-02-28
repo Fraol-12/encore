@@ -56,84 +56,117 @@ class YouTubeService:
             raise ValidationError(f"YouTube API error: {str(e)}")
 
     @transaction.atomic
-    def import_playlist_items(self, playlist: Playlist):
+    def import_playlist_items(self, playlist: Playlist) -> int:
         """
-        Fetch ALL items from the YouTube playlist (handles pagination).
-        Stores as PlaylistItem objects.
-        Uses bulk_create for performance.
-        Transactional — all or nothing.
+        Fetch ALL items from YouTube playlist, store as PlaylistItem.
+        Handles pagination, deduplication, duration fetching.
+        Returns number of new items added.
         """
+        print(f"[YT IMPORT] Starting for playlist {playlist.id} - {playlist.youtube_playlist_id}")
+
         if not playlist.youtube_playlist_id:
-            return 0  # nothing to do
+            print("[YT IMPORT] No YT ID — skipping")
+            return 0
 
         items_to_create = []
         next_page_token = None
         total_fetched = 0
+        page_num = 1  # ← THIS WAS MISSING
+        MAX_ITEMS = 500  # safety cap - prevent runaway on huge playlists
 
-        while True:
+        while total_fetched < MAX_ITEMS:
+            print(f"[YT IMPORT] Fetching page {page_num} (token: {next_page_token})")
             try:
                 response = self.client.playlistItems().list(
                     part='snippet,contentDetails',
                     playlistId=playlist.youtube_playlist_id,
-                    maxResults=50,               # max allowed per page
+                    maxResults=50,
                     pageToken=next_page_token
                 ).execute()
 
-                for yt_item in response.get('items', []):
-                    snippet = yt_item['snippet']
-                    content = yt_item['contentDetails']
+                items_in_page = response.get('items', [])
+                print(f"[YT IMPORT] Page {page_num} - {len(items_in_page)} items")
 
-                    # Skip deleted/unavailable videos (YouTube sometimes returns them)
-                    if content.get('videoId') is None:
+                for yt_item in items_in_page:
+                    content = yt_item.get('contentDetails', {})
+                    snippet = yt_item.get('snippet', {})
+
+                    video_id = content.get('videoId')
+                    if not video_id:
+                        print("[YT IMPORT] Skipping item without videoId")
                         continue
 
-                    items_to_create.append(PlaylistItem(
+                    item = PlaylistItem(
                         playlist=playlist,
-                        youtube_video_id=content['videoId'],
-                        title=snippet['title'],
-                        channel_title=snippet['channelTitle'],
-                        position=snippet['position'],
+                        youtube_video_id=video_id,
+                        title=snippet.get('title', ''),
+                        channel_title=snippet.get('channelTitle', ''),
+                        position=snippet.get('position', 0),  # will be 0 - position not returned here
                         thumbnail_url=snippet.get('thumbnails', {}).get('high', {}).get('url'),
-                        duration_seconds=None,  # we'll fetch later or leave null for now
                         added_at=timezone.now(),
-                    ))
+                    )
+
+                    # Fetch duration (1 quota unit per video)
+                    duration = self.get_video_duration(video_id)
+                    if duration is not None:
+                        item.duration_seconds = duration
+                        print(f"[YT IMPORT] Duration for {video_id}: {duration}s")
+
+                    items_to_create.append(item)
                     total_fetched += 1
 
+                    if total_fetched >= MAX_ITEMS:
+                        print(f"[YT IMPORT] Reached safety cap of {MAX_ITEMS} items")
+                        break
+
                 next_page_token = response.get('nextPageToken')
+                page_num += 1
+
                 if not next_page_token:
+                    print("[YT IMPORT] No more pages")
                     break
 
             except HttpError as e:
-                if e.resp.status in (403, 429):
-                    raise ValidationError("YouTube API quota exceeded or rate limited. Try again later.")
+                print(f"[YT IMPORT] API error: {str(e)}")
                 raise ValidationError(f"Failed to fetch playlist items: {str(e)}")
+            except Exception as e:
+                print(f"[YT IMPORT] Unexpected error: {str(e)}")
+                raise
+
+        print(f"[YT IMPORT] Total videos fetched: {total_fetched}")
 
         if items_to_create:
-            # Idempotent: skip already existing video IDs in this playlist
             existing_ids = set(
                 PlaylistItem.objects.filter(playlist=playlist)
                 .values_list('youtube_video_id', flat=True)
             )
 
-            new_items = [
-                item for item in items_to_create
-                if item.youtube_video_id not in existing_ids
-            ]
+            new_items = [item for item in items_to_create if item.youtube_video_id not in existing_ids]
 
-            PlaylistItem.objects.bulk_create(new_items, ignore_conflicts=True)
+            print(f"[YT IMPORT] New items after dedup: {len(new_items)}")
 
-        # Update count and timestamp
-        playlist.youtube_item_count = PlaylistItem.objects.filter(playlist=playlist).count()
+            if new_items:
+                PlaylistItem.objects.bulk_create(new_items, ignore_conflicts=True)
+                print("[YT IMPORT] Bulk create completed")
+
+        final_count = PlaylistItem.objects.filter(playlist=playlist).count()
+        print(f"[YT IMPORT] Final DB count: {final_count}")
+
+        playlist.youtube_item_count = final_count
         playlist.youtube_last_fetched_at = timezone.now()
         playlist.save(update_fields=['youtube_item_count', 'youtube_last_fetched_at'])
 
-        return total_fetched
+        return final_count
+
+
+
 
     def create_from_youtube(self, user, youtube_playlist_id: str) -> Playlist:
         """
         High-level method: validate, create Playlist, import items.
         All in one transaction.
         """
+        print("[CREATE] Starting create_from_youtube for user", user.email, "YT ID", youtube_playlist_id)
         metadata = self.get_playlist_metadata(youtube_playlist_id)
 
         with transaction.atomic():
@@ -158,9 +191,10 @@ class YouTubeService:
                     "You have already imported this YouTube playlist."
                 )
 
-            self.import_playlist_items(playlist)
-
-        return playlist
+            print("[CREATE] Calling import_playlist_items")
+            added = self.import_playlist_items(playlist)
+            print("[CREATE] Import finished - added", added, "items")
+            return playlist
         
     def _parse_iso_duration(self, iso_str: str) -> int:
         """Convert ISO 8601 duration (PTnHnMnS) to seconds."""

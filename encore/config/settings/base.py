@@ -109,13 +109,18 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+
+    # Throttling — disable completely in DEBUG mode for easy testing
     "DEFAULT_THROTTLE_CLASSES": (
         "rest_framework.throttling.AnonRateThrottle",
         "rest_framework.throttling.UserRateThrottle",
-    ),
+    ) if not DEBUG else (),  # ← THIS LINE DISABLES THROTTLING IN DEVELOPMENT
+
     "DEFAULT_THROTTLE_RATES": {
         "anon": env("DRF_THROTTLE_ANON", default="30/min"),
         "user": env("DRF_THROTTLE_USER", default="120/min"),
+        # Optional: add a specific scope for sync if you want finer control later
+        # "sync": "10/minute",
     },
 }
 
@@ -154,6 +159,7 @@ SPOTIFY_REDIRECT_URI = env(
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_SCOPES = "playlist-modify-public playlist-modify-private playlist-read-private user-read-private"
+SPOTIFY_RATE_LIMIT_MAX_COOLDOWN_SECONDS = env.float("SPOTIFY_RATE_LIMIT_MAX_COOLDOWN_SECONDS", default=300.0)
 
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])

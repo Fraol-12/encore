@@ -1,6 +1,7 @@
 import math
 
 from celery import current_app
+from django.conf import settings
 from django.db import IntegrityError
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -34,6 +35,14 @@ class PlaylistViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return self.queryset.filter(user=self.request.user)
 
+    def _max_rate_limit_cooldown_seconds(self) -> int:
+        raw_value = getattr(settings, "SPOTIFY_RATE_LIMIT_MAX_COOLDOWN_SECONDS", 300)
+        try:
+            parsed = int(float(raw_value))
+        except (TypeError, ValueError):
+            parsed = 300
+        return max(1, min(parsed, 86400))
+
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -62,6 +71,7 @@ class PlaylistViewSet(viewsets.ModelViewSet):
         source_operation_id = None
         source_playlist_id = None
 
+        max_cooldown = self._max_rate_limit_cooldown_seconds()
         now = timezone.now()
         for operation in recent_failed:
             if not isinstance(operation.errors, dict):
@@ -70,7 +80,7 @@ class PlaylistViewSet(viewsets.ModelViewSet):
             if not isinstance(summary, dict) or not summary.get("rate_limited"):
                 continue
 
-            retry_after = int(summary.get("retry_after_seconds") or 0)
+            retry_after = min(int(summary.get("retry_after_seconds") or 0), max_cooldown)
             if retry_after <= 0 or not operation.ended_at:
                 continue
 
@@ -86,6 +96,7 @@ class PlaylistViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="sync")
     def sync(self, request, pk=None):
         playlist = self.get_object()
+        max_cooldown = self._max_rate_limit_cooldown_seconds()
 
         user_remaining, user_op_id, user_playlist_id = self._get_rate_limit_cooldown_for_user(request.user)
         if user_remaining > 0:
@@ -108,7 +119,7 @@ class PlaylistViewSet(viewsets.ModelViewSet):
         if last_failed and isinstance(last_failed.errors, dict):
             summary = last_failed.errors.get("summary") or {}
             if isinstance(summary, dict) and summary.get("rate_limited"):
-                retry_after = int(summary.get("retry_after_seconds") or 0)
+                retry_after = min(int(summary.get("retry_after_seconds") or 0), max_cooldown)
                 ended_at = last_failed.ended_at
                 if retry_after > 0 and ended_at:
                     elapsed = (timezone.now() - ended_at).total_seconds()

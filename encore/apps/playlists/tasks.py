@@ -181,6 +181,26 @@ def process_sync(sync_operation_id: int):
         source_item_count = len(playlist_items)
 
         if source_item_count > 0 and not desired_uris:
+            created_placeholder_playlist = False
+            if rate_limit_retry_after_seconds > 0 and not playlist.spotify_playlist_id:
+                try:
+                    created = spotify.create_playlist(
+                        name=playlist.title,
+                        description=playlist.description or "Imported by Encore",
+                        public=False,
+                    )
+                    playlist.spotify_playlist_id = created.get("id")
+                    playlist.spotify_playlist_uri = created.get("uri")
+                    playlist.save(update_fields=["spotify_playlist_id", "spotify_playlist_uri", "updated_at"])
+                    created_placeholder_playlist = bool(playlist.spotify_playlist_id)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(
+                        {
+                            "spotify_playlist_create_error": str(exc),
+                            "context": "rate_limited_no_matches",
+                        }
+                    )
+
             operation_status = "failed" if search_unavailable_count > 0 else "partial"
             summary_error = {
                 "item_errors": errors,
@@ -196,6 +216,8 @@ def process_sync(sync_operation_id: int):
                     "spotify_search_unavailable_count": search_unavailable_count,
                     "rate_limited": rate_limit_retry_after_seconds > 0,
                     "retry_after_seconds": int(math.ceil(rate_limit_retry_after_seconds)) if rate_limit_retry_after_seconds > 0 else 0,
+                    "spotify_playlist_created_while_rate_limited": created_placeholder_playlist,
+                    "spotify_playlist_id": playlist.spotify_playlist_id,
                 },
             }
             with transaction.atomic():

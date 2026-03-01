@@ -24,7 +24,8 @@ class YouTubeService:
     def __init__(self):
         if not settings.YOUTUBE_API_KEY:
             raise RuntimeError("YOUTUBE_API_KEY is not configured in settings")
-        self.client = build("youtube", "v3", developerKey=settings.YOUTUBE_API_KEY)
+        # Disable discovery cache to avoid oauth2client-related cache warnings at runtime.
+        self.client = build("youtube", "v3", developerKey=settings.YOUTUBE_API_KEY, cache_discovery=False)
 
     def _parse_retry_after(self, error: HttpError) -> float | None:
         header_value = None

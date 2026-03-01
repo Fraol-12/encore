@@ -3,7 +3,9 @@ import re
 import time
 
 import requests
+from django.conf import settings
 from rapidfuzz import fuzz
+
 
 from apps.playlists.models import PlaylistItem, TrackMatch
 
@@ -16,6 +18,18 @@ from .retry_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Global rate limiter (simple)
+last_search_time = 0
+
+def search_with_throttle(query: str, limit: int = 10) -> list[dict]:
+    global last_search_time
+    now = time.time()
+    elapsed = now - last_search_time
+    if elapsed < 2.0:
+        time.sleep(2.0 - elapsed)
+    last_search_time = time.time()
+    # then call spotify.search(...)
+    
 
 class SpotifySearchUnavailable(RuntimeError):
     """Raised when Spotify search is temporarily unavailable (rate limit/5xx)."""
@@ -35,13 +49,24 @@ class SpotifyMatchingService:
     SEARCH_URL = "https://api.spotify.com/v1/search"
     RETRYABLE_STATUS = {429, 500, 502, 503, 504}
     MIN_CONFIDENCE = 0.55
-    MAX_RATE_LIMIT_COOLDOWN = 86400.0
+    MAX_RATE_LIMIT_COOLDOWN_CAP = 86400.0
+    DEFAULT_MAX_RATE_LIMIT_COOLDOWN = 300.0
 
     def __init__(self, access_token: str):
         self.headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         }
+        configured_cooldown = getattr(
+            settings,
+            "SPOTIFY_RATE_LIMIT_MAX_COOLDOWN_SECONDS",
+            self.DEFAULT_MAX_RATE_LIMIT_COOLDOWN,
+        )
+        try:
+            configured_cooldown = float(configured_cooldown)
+        except (TypeError, ValueError):
+            configured_cooldown = self.DEFAULT_MAX_RATE_LIMIT_COOLDOWN
+        self.max_rate_limit_cooldown = max(2.0, min(configured_cooldown, self.MAX_RATE_LIMIT_COOLDOWN_CAP))
         self.rate_limited_until = 0.0
         self._next_cooldown_log_at = 0.0
         self._next_request_at = 0.0
@@ -143,15 +168,17 @@ class SpotifyMatchingService:
             if resp.status_code == 401:
                 raise UnauthorizedAPIError("Spotify token revoked or expired during search")
             if resp.status_code in self.RETRYABLE_STATUS:
-                retry_after = parse_retry_after(resp.headers.get("Retry-After"))
+                retry_after_raw = resp.headers.get("Retry-After")
+                retry_after = parse_retry_after(retry_after_raw)
                 if resp.status_code == 429:
-                    cooldown = min(max(retry_after or 2.0, 2.0), self.MAX_RATE_LIMIT_COOLDOWN)
+                    cooldown = min(max(retry_after or 2.0, 2.0), self.max_rate_limit_cooldown)
                     self.rate_limited_until = max(self.rate_limited_until, time.time() + cooldown)
                     self._next_cooldown_log_at = 0.0
                     logger.warning(
-                        "Spotify 429 on search '%s' (Retry-After raw=%s parsed=%.2fs)",
+                        "Spotify 429 on search '%s' (Retry-After raw=%s parsed=%.2fs capped=%.2fs)",
                         query,
-                        resp.headers.get("Retry-After"),
+                        retry_after_raw,
+                        retry_after or 0.0,
                         cooldown,
                     )
                     raise SpotifyRateLimited(

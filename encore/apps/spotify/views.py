@@ -1,120 +1,164 @@
+import base64
+import binascii
+import secrets
+from datetime import timedelta
+from urllib.parse import urlencode
+
+import requests
 from django.conf import settings
-from django.http import JsonResponse, HttpResponseRedirect
-from django.urls import reverse
-from rest_framework.views import APIView
+from django.contrib.auth import get_user_model
+from django.core import signing
+from django.utils import timezone
+from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework import status
-import requests
-from urllib.parse import urlencode
-import secrets
-from apps.users.models import SpotifyAccount
-from django.core.cache import cache 
-import base64 
-from django.contrib.auth import get_user_model  # << updated here
-from django.utils import timezone 
-from datetime import timedelta
+from rest_framework.views import APIView
 
-CustomUser = get_user_model()  # << define CustomUser
+from apps.users.models import SpotifyAccount
+
+CustomUser = get_user_model()
+
+STATE_TTL_SECONDS = 600
 
 
 class SpotifyLoginView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        state_raw = f"{request.user.id}:{secrets.token_urlsafe(32)}"
-        state = base64.urlsafe_b64encode(state_raw.encode()).decode().rstrip('=')
+        nonce = secrets.token_urlsafe(32)
+        state_raw = f"{request.user.id}:{nonce}"
+        signer = signing.TimestampSigner(salt="spotify-oauth-state")
+        signed_state = signer.sign(state_raw)
+        state = base64.urlsafe_b64encode(signed_state.encode()).decode().rstrip("=")
 
         params = {
-            'client_id': settings.SPOTIFY_CLIENT_ID,
-            'response_type': 'code',
-            'redirect_uri': settings.SPOTIFY_REDIRECT_URI,
-            'scope': settings.SPOTIFY_SCOPES,
-            'state': state,
-            'show_dialog': 'true',
+            "client_id": settings.SPOTIFY_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": settings.SPOTIFY_REDIRECT_URI,
+            "scope": settings.SPOTIFY_SCOPES,
+            "state": state,
+            "show_dialog": "true",
         }
-
         auth_url = f"{settings.SPOTIFY_AUTH_URL}?{urlencode(params)}"
-        return JsonResponse({'auth_url': auth_url})
-    
-
+        return Response({"auth_url": auth_url}, status=status.HTTP_200_OK)
 
 
 class SpotifyCallbackView(APIView):
     permission_classes = []
+    authentication_classes = []
 
     def get(self, request):
-        code = request.GET.get('code')
-        state = request.GET.get('state')
-        error = request.GET.get('error')
+        code = request.GET.get("code")
+        state = request.GET.get("state")
+        error = request.GET.get("error")
 
         if error:
-            return Response({'error': error}, status=400)
+            return Response({"error": error}, status=status.HTTP_400_BAD_REQUEST)
 
         if not code or not state:
-            return Response({'error': 'Missing parameters'}, status=400)
+            return Response({"error": "Missing parameters"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Decode state
         try:
-            decoded = base64.urlsafe_b64decode(state + '===').decode()
-            user_id_str, stored_state = decoded.split(':', 1)
+            signed_state = base64.urlsafe_b64decode(state + "===").decode()
+            signer = signing.TimestampSigner(salt="spotify-oauth-state")
+            decoded = signer.unsign(signed_state, max_age=STATE_TTL_SECONDS)
+            user_id_str, _nonce = decoded.split(":", 1)
             user_id = int(user_id_str)
-        except:
-            return Response({'error': 'Invalid state format'}, status=400)
+        except (
+            ValueError,
+            UnicodeDecodeError,
+            binascii.Error,
+            signing.BadSignature,
+            signing.SignatureExpired,
+        ):
+            return Response({"error": "Invalid state"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Reconstruct original state (we only need to verify format)
-        # In real code, store nonce in cache with user_id as key
-
-        # Exchange code for tokens
         payload = {
-            'grant_type': 'authorization_code',
-            'code': code,
-            'redirect_uri': settings.SPOTIFY_REDIRECT_URI,
-            'client_id': settings.SPOTIFY_CLIENT_ID,
-            'client_secret': settings.SPOTIFY_CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": settings.SPOTIFY_REDIRECT_URI,
+            "client_id": settings.SPOTIFY_CLIENT_ID,
+            "client_secret": settings.SPOTIFY_CLIENT_SECRET,
         }
 
-        response = requests.post(settings.SPOTIFY_TOKEN_URL, data=payload)
-        if response.status_code != 200:
-            return Response({'error': 'Token exchange failed'}, status=400)
+        try:
+            token_response = requests.post(settings.SPOTIFY_TOKEN_URL, data=payload, timeout=15)
+        except requests.RequestException:
+            return Response({"error": "Spotify token request failed"}, status=status.HTTP_502_BAD_GATEWAY)
 
-        tokens = response.json()
+        if token_response.status_code != 200:
+            return Response(
+                {"error": "Token exchange failed", "details": token_response.text[:300]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        # Get user profile
-        headers = {'Authorization': f"Bearer {tokens['access_token']}"}
-        me = requests.get('https://api.spotify.com/v1/me', headers=headers).json()
+        tokens = token_response.json()
+        access_token = tokens.get("access_token")
+        if not access_token:
+            return Response({"error": "Token response missing access token"}, status=status.HTTP_400_BAD_REQUEST)
+        granted_scope = (tokens.get("scope") or settings.SPOTIFY_SCOPES).strip()
 
-        # Store account
-        user = CustomUser.objects.get(id=user_id)
-        account, _ = SpotifyAccount.objects.update_or_create(
+        try:
+            me_resp = requests.get(
+                "https://api.spotify.com/v1/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=15,
+            )
+        except requests.RequestException:
+            return Response({"error": "Failed to fetch Spotify profile"}, status=status.HTTP_502_BAD_GATEWAY)
+
+        if me_resp.status_code != 200:
+            return Response(
+                {"error": "Failed to fetch Spotify profile", "details": me_resp.text[:300]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        me = me_resp.json()
+
+        try:
+            user = CustomUser.objects.get(id=user_id)
+        except CustomUser.DoesNotExist:
+            return Response({"error": "User not found for OAuth state"}, status=status.HTTP_400_BAD_REQUEST)
+
+        SpotifyAccount.objects.update_or_create(
             user=user,
             defaults={
-                'spotify_user_id': me['id'],
-                'access_token': tokens['access_token'],
-                'refresh_token': tokens.get('refresh_token'),
-                'expires_at': timezone.now() + timedelta(seconds=tokens['expires_in']),
-                'scope': tokens['scope'],
-                'is_active': True,
-            }
+                "spotify_user_id": me.get("id", ""),
+                "access_token": access_token,
+                "refresh_token": tokens.get("refresh_token"),
+                "expires_at": timezone.now() + timedelta(seconds=tokens.get("expires_in", 3600)),
+                "scope": granted_scope,
+                "is_active": True,
+            },
         )
 
-        return Response({
-            'message': 'Spotify linked',
-            'spotify_user_id': me['id']
-        }, status=200)
-    
+        return Response(
+            {
+                "message": "Spotify linked",
+                "spotify_user_id": me.get("id"),
+                "scope": granted_scope,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class SpotifyStatusView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         try:
             account = request.user.spotify_account
-            return Response({
-                'linked': True,
-                'spotify_user_id': account.spotify_user_id,
-                'expires_at': account.expires_at,
-                'is_active': account.is_active,
-                'last_updated': account.updated_at
-            })
         except SpotifyAccount.DoesNotExist:
-            return Response({'linked': False})    
+            return Response({"linked": False}, status=status.HTTP_200_OK)
+
+        return Response(
+            {
+                "linked": True,
+                "spotify_user_id": account.spotify_user_id,
+                "scope": account.scope,
+                "expires_at": account.expires_at,
+                "is_active": account.is_active,
+                "last_updated": account.updated_at,
+            },
+            status=status.HTTP_200_OK,
+        )

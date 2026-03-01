@@ -5,6 +5,7 @@ from django.utils.translation import gettext_lazy as _
 from encrypted_model_fields.fields import EncryptedCharField 
 from datetime import timedelta 
 import requests 
+import time
 from django.conf import settings
 
 class CustomUserManager(BaseUserManager):
@@ -127,9 +128,23 @@ class SpotifyAccount(models.Model):
         }
 
         try:
-            resp = requests.post(settings.SPOTIFY_TOKEN_URL, data=payload, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
+            data = None
+            last_error = None
+            for attempt in range(1, 4):
+                resp = requests.post(settings.SPOTIFY_TOKEN_URL, data=payload, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    break
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                    retry_after = resp.headers.get("Retry-After")
+                    delay = float(retry_after) if retry_after and retry_after.isdigit() else float(2 ** (attempt - 1))
+                    time.sleep(min(delay, 30.0))
+                    continue
+                last_error = RuntimeError(f"Spotify refresh failed ({resp.status_code}): {resp.text[:300]}")
+                break
+
+            if data is None:
+                raise last_error or RuntimeError("Spotify refresh failed with unknown error")
 
             self.access_token = data['access_token']
             self.expires_at = timezone.now() + timedelta(seconds=data['expires_in'])
@@ -143,7 +158,7 @@ class SpotifyAccount(models.Model):
 
             print(f"Refreshed token for user {self.user.email} — new expiry: {self.expires_at}")
 
-        except requests.RequestException as e:
+        except (requests.RequestException, RuntimeError) as e:
             print(f"Refresh failed for {self.user.email}: {str(e)}")
             self.is_active = False
             self.save(update_fields=['is_active'])

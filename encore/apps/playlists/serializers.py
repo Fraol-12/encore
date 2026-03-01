@@ -7,13 +7,14 @@ class PlaylistSerializer(serializers.ModelSerializer):
         model = Playlist
         fields = [
             'id', 'title', 'description', 'youtube_playlist_id',
-            'spotify_playlist_id', 'sync_status', 'source_status',
+            'spotify_playlist_id', 'spotify_playlist_uri', 'sync_mode',
+            'sync_status', 'source_status',
             'youtube_channel_title', 'youtube_item_count', 'youtube_thumbnail_url',
             'youtube_published_at', 'youtube_last_fetched_at', 'youtube_privacy_status',
             'created_at', 'updated_at'
         ]
         read_only_fields = [
-            'id', 'sync_status', 'source_status',
+            'id', 'spotify_playlist_id', 'spotify_playlist_uri', 'sync_status', 'source_status',
             'youtube_channel_title', 'youtube_item_count', 'youtube_thumbnail_url',
             'youtube_published_at', 'youtube_last_fetched_at', 'youtube_privacy_status',
             'created_at', 'updated_at'

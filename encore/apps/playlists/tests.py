@@ -12,6 +12,7 @@ from apps.playlists.services.spotify_matching import (
     SpotifyMatchingService,
     SpotifyRateLimited,
 )
+from apps.playlists.services.spotify_service import SpotifyService
 from apps.playlists.services.youtube_service import YouTubeService
 from apps.playlists.tasks import process_sync
 from apps.users.models import CustomUser, SpotifyAccount
@@ -89,11 +90,118 @@ class SpotifyMatchingServiceTests(TestCase, FactoryMixin):
         self.assertEqual(uri, "spotify:track:track123")
         self.assertTrue(TrackMatch.objects.filter(playlist_item=item, is_active=True).exists())
 
+    @patch("apps.playlists.services.spotify_matching.SpotifyMatchingService.search_spotify")
+    def test_match_item_uses_quoted_title_variant_for_noisy_titles(self, mock_search):
+        user = self.make_user(email="quoted@example.com")
+        playlist = self.make_playlist(user, youtube_playlist_id="PL_QUOTED")
+        item = self.make_item(
+            playlist,
+            youtube_video_id="vid-quoted",
+            title='"Listen to the Music" Songs Around The World',
+            channel_title="Playing For Change",
+            duration_seconds=228,
+        )
+
+        def fake_search(query, limit=10):  # noqa: ARG001
+            if query == "track:Listen to the Music":
+                return [
+                    {
+                        "id": "track-quoted-1",
+                        "uri": "spotify:track:track-quoted-1",
+                        "name": "Listen to the Music",
+                        "artists": [{"name": "The Doobie Brothers"}],
+                        "duration_ms": 227000,
+                    }
+                ]
+            return []
+
+        mock_search.side_effect = fake_search
+
+        service = SpotifyMatchingService("token")
+        uri = service.match_item(item)
+
+        self.assertEqual(uri, "spotify:track:track-quoted-1")
+        queried = [call.args[0] for call in mock_search.call_args_list]
+        self.assertIn("track:Listen to the Music", queried)
+
     def test_search_spotify_rate_limit_fails_fast(self):
         service = SpotifyMatchingService("token")
         service.rate_limited_until = timezone.now().timestamp() + 30
         with self.assertRaises(SpotifyRateLimited):
             service.search_spotify("track:test", limit=5)
+
+    @patch("apps.playlists.services.spotify_matching.requests.get")
+    def test_search_spotify_uses_configured_market(self, mock_get):
+        response = MagicMock()
+        response.status_code = 200
+        response.text = ""
+        response.json.return_value = {"tracks": {"items": []}}
+        mock_get.return_value = response
+
+        service = SpotifyMatchingService("token", market="et")
+        service.search_spotify("track:test", limit=5)
+
+        params = mock_get.call_args.kwargs["params"]
+        self.assertEqual(params["market"], "ET")
+
+    @patch("apps.playlists.services.spotify_matching.requests.get")
+    def test_search_spotify_omits_market_when_not_set(self, mock_get):
+        response = MagicMock()
+        response.status_code = 200
+        response.text = ""
+        response.json.return_value = {"tracks": {"items": []}}
+        mock_get.return_value = response
+
+        service = SpotifyMatchingService("token")
+        service.search_spotify("track:test", limit=5)
+
+        params = mock_get.call_args.kwargs["params"]
+        self.assertNotIn("market", params)
+
+    @patch("apps.playlists.services.spotify_matching.requests.get")
+    def test_search_spotify_clamps_limit_to_10(self, mock_get):
+        response = MagicMock()
+        response.status_code = 200
+        response.text = ""
+        response.json.return_value = {"tracks": {"items": []}}
+        mock_get.return_value = response
+
+        service = SpotifyMatchingService("token")
+        service.search_spotify("track:test", limit=25)
+
+        params = mock_get.call_args.kwargs["params"]
+        self.assertEqual(params["limit"], 10)
+
+
+class SpotifyServiceTests(TestCase):
+    def test_add_tracks_uses_items_endpoint(self):
+        service = SpotifyService("token")
+        with patch.object(service, "_request", return_value={}) as mock_request:
+            added = service.add_tracks("playlist123", ["spotify:track:a", "spotify:track:b"])
+
+        self.assertEqual(added, 2)
+        args = mock_request.call_args[0]
+        kwargs = mock_request.call_args[1]
+        self.assertEqual(args[0], "POST")
+        self.assertEqual(args[1], "/playlists/playlist123/items")
+        self.assertEqual(kwargs["payload"], {"uris": ["spotify:track:a", "spotify:track:b"]})
+
+    def test_get_playlist_track_uris_reads_items_endpoint_shape(self):
+        service = SpotifyService("token")
+        payload = {
+            "items": [
+                {"item": {"uri": "spotify:track:a"}},
+                {"uri": "spotify:track:b"},
+                {"track": {"uri": "spotify:track:c"}},
+            ],
+            "next": None,
+        }
+        with patch.object(service, "_request", return_value=payload) as mock_request:
+            uris = service.get_playlist_track_uris("playlist123")
+
+        self.assertEqual(uris, ["spotify:track:a", "spotify:track:b", "spotify:track:c"])
+        args = mock_request.call_args[0]
+        self.assertEqual(args[1], "/playlists/playlist123/items")
 
 
 class YouTubeServiceTests(TestCase, FactoryMixin):
@@ -215,12 +323,14 @@ class ProcessSyncTaskTests(TestCase, FactoryMixin):
     @patch("apps.playlists.tasks.SpotifyService.add_tracks")
     @patch("apps.playlists.tasks.SpotifyService.get_playlist_track_uris")
     @patch("apps.playlists.tasks.SpotifyService.create_playlist")
+    @patch("apps.playlists.tasks.SpotifyService.get_current_user")
     @patch("apps.playlists.tasks.SpotifyMatchingService.match_item")
     @patch("apps.playlists.tasks.YouTubeService.resync_playlist")
     def test_process_sync_creates_playlist_and_adds_tracks(
         self,
         mock_resync,
         mock_match_item,
+        mock_get_current_user,
         mock_create_playlist,
         mock_get_track_uris,
         mock_add_tracks,
@@ -234,6 +344,7 @@ class ProcessSyncTaskTests(TestCase, FactoryMixin):
 
         mock_resync.return_value = {"status": "completed", "added": 0, "updated": 0, "removed": 0, "total": 1}
         mock_match_item.return_value = "spotify:track:track123"
+        mock_get_current_user.return_value = {"id": "spotify-user-1"}
         mock_create_playlist.return_value = {"id": "pl123", "uri": "spotify:playlist:pl123"}
         mock_get_track_uris.return_value = []
         mock_add_tracks.return_value = 1
@@ -254,14 +365,18 @@ class ProcessSyncTaskTests(TestCase, FactoryMixin):
     @patch("apps.playlists.tasks.SpotifyService.remove_tracks")
     @patch("apps.playlists.tasks.SpotifyService.add_tracks")
     @patch("apps.playlists.tasks.SpotifyService.get_playlist_track_uris")
+    @patch("apps.playlists.tasks.SpotifyService.update_playlist")
     @patch("apps.playlists.tasks.SpotifyService.create_playlist")
+    @patch("apps.playlists.tasks.SpotifyService.get_current_user")
     @patch("apps.playlists.tasks.SpotifyMatchingService.match_item")
     @patch("apps.playlists.tasks.YouTubeService.resync_playlist")
     def test_smart_diff_preserves_manual_tracks(
         self,
         mock_resync,
         mock_match_item,
+        mock_get_current_user,
         mock_create_playlist,
+        mock_update_playlist,
         mock_get_track_uris,
         mock_add_tracks,
         mock_remove_tracks,
@@ -304,7 +419,9 @@ class ProcessSyncTaskTests(TestCase, FactoryMixin):
 
         mock_resync.return_value = {"status": "completed", "added": 0, "updated": 0, "removed": 0, "total": 1}
         mock_match_item.return_value = "spotify:track:desired"
+        mock_get_current_user.return_value = {"id": "spotify-user-1"}
         mock_create_playlist.return_value = {"id": "sp-pl-recreated", "uri": "spotify:playlist:sp-pl-recreated"}
+        mock_update_playlist.return_value = None
         mock_get_track_uris.return_value = [
             "spotify:track:desired",
             "spotify:track:managed-old",
@@ -319,9 +436,10 @@ class ProcessSyncTaskTests(TestCase, FactoryMixin):
         self.assertEqual(remove_args[0], "sp-pl-1")
         self.assertEqual(remove_args[1], ["spotify:track:managed-old"])
 
+    @patch("apps.playlists.tasks.SpotifyService.get_current_user")
     @patch("apps.playlists.tasks.SpotifyMatchingService.match_item")
     @patch("apps.playlists.tasks.YouTubeService.resync_playlist")
-    def test_process_sync_marks_account_inactive_on_unauthorized(self, mock_resync, mock_match_item):
+    def test_process_sync_marks_account_inactive_on_unauthorized(self, mock_resync, mock_match_item, mock_get_current_user):
         user = self.make_user(email="unauth@example.com")
         account = self.make_spotify_account(user)
         playlist = self.make_playlist(user, spotify_playlist_id="sp-pl-unauth")
@@ -329,6 +447,7 @@ class ProcessSyncTaskTests(TestCase, FactoryMixin):
         operation = SyncOperation.objects.create(playlist=playlist, status="queued")
 
         mock_resync.return_value = {"status": "completed", "added": 0, "updated": 0, "removed": 0, "total": 1}
+        mock_get_current_user.return_value = {"id": "spotify-user-1"}
         mock_match_item.side_effect = UnauthorizedAPIError("token invalid")
 
         process_sync(operation.id)
@@ -342,12 +461,14 @@ class ProcessSyncTaskTests(TestCase, FactoryMixin):
         self.assertEqual(playlist.sync_status, "failed")
 
     @patch("apps.playlists.tasks.SpotifyService.create_playlist")
+    @patch("apps.playlists.tasks.SpotifyService.get_current_user")
     @patch("apps.playlists.tasks.SpotifyMatchingService.match_item")
     @patch("apps.playlists.tasks.YouTubeService.resync_playlist")
     def test_process_sync_does_not_create_empty_spotify_playlist_when_no_matches(
         self,
         mock_resync,
         mock_match_item,
+        mock_get_current_user,
         mock_create_playlist,
     ):
         user = self.make_user(email="nomatch@example.com")
@@ -357,6 +478,7 @@ class ProcessSyncTaskTests(TestCase, FactoryMixin):
         operation = SyncOperation.objects.create(playlist=playlist, status="queued")
 
         mock_resync.return_value = {"status": "completed", "added": 0, "updated": 0, "removed": 0, "total": 1}
+        mock_get_current_user.return_value = {"id": "spotify-user-1"}
         mock_match_item.return_value = None
 
         process_sync(operation.id)
@@ -371,16 +493,22 @@ class ProcessSyncTaskTests(TestCase, FactoryMixin):
 
     @patch("apps.playlists.tasks.SpotifyService.remove_tracks")
     @patch("apps.playlists.tasks.SpotifyService.add_tracks")
+    @patch("apps.playlists.tasks.SpotifyService.add_tracks_best_effort")
     @patch("apps.playlists.tasks.SpotifyService.get_playlist_track_uris")
+    @patch("apps.playlists.tasks.SpotifyService.update_playlist")
     @patch("apps.playlists.tasks.SpotifyService.create_playlist")
+    @patch("apps.playlists.tasks.SpotifyService.get_current_user")
     @patch("apps.playlists.tasks.SpotifyMatchingService.match_item")
     @patch("apps.playlists.tasks.YouTubeService.resync_playlist")
     def test_process_sync_recreates_playlist_when_existing_playlist_read_is_forbidden(
         self,
         mock_resync,
         mock_match_item,
+        mock_get_current_user,
         mock_create_playlist,
+        mock_update_playlist,
         mock_get_track_uris,
+        mock_add_tracks_best_effort,
         mock_add_tracks,
         mock_remove_tracks,
     ):
@@ -391,9 +519,11 @@ class ProcessSyncTaskTests(TestCase, FactoryMixin):
         operation = SyncOperation.objects.create(playlist=playlist, status="queued")
 
         mock_resync.return_value = {"status": "completed", "added": 0, "updated": 0, "removed": 0, "total": 1}
+        mock_get_current_user.return_value = {"id": "spotify-user-1"}
         mock_match_item.return_value = "spotify:track:new-track"
         mock_get_track_uris.side_effect = ForbiddenAPIError("forbidden read")
         mock_create_playlist.return_value = {"id": "sp-pl-new", "uri": "spotify:playlist:sp-pl-new"}
+        mock_update_playlist.return_value = None
         mock_add_tracks.return_value = 1
         mock_remove_tracks.return_value = 0
 
@@ -407,13 +537,127 @@ class ProcessSyncTaskTests(TestCase, FactoryMixin):
         add_args = mock_add_tracks.call_args[0]
         self.assertEqual(add_args[0], "sp-pl-new")
 
+    @patch("apps.playlists.tasks.SpotifyService.remove_tracks")
+    @patch("apps.playlists.tasks.SpotifyService.add_tracks")
+    @patch("apps.playlists.tasks.SpotifyService.add_tracks_best_effort")
+    @patch("apps.playlists.tasks.SpotifyService.get_playlist_track_uris")
+    @patch("apps.playlists.tasks.SpotifyService.update_playlist")
     @patch("apps.playlists.tasks.SpotifyService.create_playlist")
+    @patch("apps.playlists.tasks.SpotifyService.get_current_user")
+    @patch("apps.playlists.tasks.SpotifyMatchingService.match_item")
+    @patch("apps.playlists.tasks.YouTubeService.resync_playlist")
+    def test_process_sync_recreates_playlist_when_add_tracks_is_forbidden(
+        self,
+        mock_resync,
+        mock_match_item,
+        mock_get_current_user,
+        mock_create_playlist,
+        mock_update_playlist,
+        mock_get_track_uris,
+        mock_add_tracks_best_effort,
+        mock_add_tracks,
+        mock_remove_tracks,
+    ):
+        user = self.make_user(email="forbidden-write@example.com")
+        self.make_spotify_account(user)
+        playlist = self.make_playlist(
+            user,
+            youtube_playlist_id="PL_WRITE_FORBIDDEN",
+            spotify_playlist_id="sp-pl-old",
+            spotify_playlist_uri="spotify:playlist:sp-pl-old",
+        )
+        self.make_item(playlist, youtube_video_id="vid-fw-1")
+        operation = SyncOperation.objects.create(playlist=playlist, status="queued")
+
+        mock_resync.return_value = {"status": "completed", "added": 0, "updated": 0, "removed": 0, "total": 1}
+        mock_get_current_user.return_value = {"id": "spotify-user-1"}
+        mock_match_item.return_value = "spotify:track:new-track"
+        mock_update_playlist.return_value = None
+        mock_get_track_uris.return_value = []
+        mock_add_tracks.side_effect = [ForbiddenAPIError("forbidden write"), 1]
+        mock_add_tracks_best_effort.return_value = (0, [])
+        mock_remove_tracks.return_value = 0
+        mock_create_playlist.return_value = {"id": "sp-pl-new", "uri": "spotify:playlist:sp-pl-new"}
+
+        process_sync(operation.id)
+
+        playlist.refresh_from_db()
+        operation.refresh_from_db()
+
+        self.assertEqual(playlist.spotify_playlist_id, "sp-pl-new")
+        self.assertEqual(operation.status, "partial")
+        self.assertEqual(operation.matched_count, 1)
+        self.assertEqual(operation.errors["summary"]["added_to_spotify"], 1)
+
+        self.assertEqual(mock_add_tracks.call_count, 2)
+        first_call_args = mock_add_tracks.call_args_list[0][0]
+        second_call_args = mock_add_tracks.call_args_list[1][0]
+        self.assertEqual(first_call_args[0], "sp-pl-old")
+        self.assertEqual(second_call_args[0], "sp-pl-new")
+        mock_remove_tracks.assert_not_called()
+
+    @patch("apps.playlists.tasks.SpotifyService.remove_tracks")
+    @patch("apps.playlists.tasks.SpotifyService.add_tracks")
+    @patch("apps.playlists.tasks.SpotifyService.add_tracks_best_effort")
+    @patch("apps.playlists.tasks.SpotifyService.get_playlist_track_uris")
+    @patch("apps.playlists.tasks.SpotifyService.update_playlist")
+    @patch("apps.playlists.tasks.SpotifyService.create_playlist")
+    @patch("apps.playlists.tasks.SpotifyService.get_current_user")
+    @patch("apps.playlists.tasks.SpotifyMatchingService.match_item")
+    @patch("apps.playlists.tasks.YouTubeService.resync_playlist")
+    def test_process_sync_uses_best_effort_add_after_recreate_forbidden(
+        self,
+        mock_resync,
+        mock_match_item,
+        mock_get_current_user,
+        mock_create_playlist,
+        mock_update_playlist,
+        mock_get_track_uris,
+        mock_add_tracks_best_effort,
+        mock_add_tracks,
+        mock_remove_tracks,
+    ):
+        user = self.make_user(email="best-effort@example.com")
+        self.make_spotify_account(user)
+        playlist = self.make_playlist(
+            user,
+            youtube_playlist_id="PL_BEST_EFFORT",
+            spotify_playlist_id="sp-pl-old",
+            spotify_playlist_uri="spotify:playlist:sp-pl-old",
+        )
+        self.make_item(playlist, youtube_video_id="vid-be-1")
+        self.make_item(playlist, youtube_video_id="vid-be-2", position=1)
+        operation = SyncOperation.objects.create(playlist=playlist, status="queued")
+
+        mock_resync.return_value = {"status": "completed", "added": 0, "updated": 0, "removed": 0, "total": 2}
+        mock_get_current_user.return_value = {"id": "spotify-user-1", "country": "ET"}
+        mock_match_item.side_effect = ["spotify:track:t1", "spotify:track:t2"]
+        mock_update_playlist.return_value = None
+        mock_get_track_uris.return_value = []
+        mock_add_tracks.side_effect = [ForbiddenAPIError("forbidden write"), ForbiddenAPIError("forbidden write again")]
+        mock_add_tracks_best_effort.return_value = (1, ["spotify:track:t2"])
+        mock_remove_tracks.return_value = 0
+        mock_create_playlist.return_value = {"id": "sp-pl-new", "uri": "spotify:playlist:sp-pl-new"}
+
+        process_sync(operation.id)
+
+        operation.refresh_from_db()
+        playlist.refresh_from_db()
+
+        self.assertEqual(playlist.spotify_playlist_id, "sp-pl-new")
+        self.assertEqual(operation.status, "partial")
+        self.assertEqual(operation.errors["summary"]["added_to_spotify"], 1)
+        self.assertEqual(mock_add_tracks_best_effort.call_count, 1)
+
+    @patch("apps.playlists.tasks.SpotifyService.create_playlist")
+    @patch("apps.playlists.tasks.SpotifyService.get_current_user")
     @patch("apps.playlists.tasks.SpotifyMatchingService.match_item")
     @patch("apps.playlists.tasks.YouTubeService.resync_playlist")
     def test_process_sync_aborts_fast_on_rate_limit(
         self,
         mock_resync,
         mock_match_item,
+        mock_get_current_user,
         mock_create_playlist,
     ):
         user = self.make_user(email="ratelimit@example.com")
@@ -424,6 +668,7 @@ class ProcessSyncTaskTests(TestCase, FactoryMixin):
         operation = SyncOperation.objects.create(playlist=playlist, status="queued")
 
         mock_resync.return_value = {"status": "completed", "added": 0, "updated": 0, "removed": 0, "total": 2}
+        mock_get_current_user.return_value = {"id": "spotify-user-1"}
         mock_match_item.side_effect = SpotifyRateLimited("Spotify rate-limited. Retry after 30.0s.")
 
         process_sync(operation.id)

@@ -3,6 +3,9 @@ from .base import *  # noqa: F401,F403
 DEBUG = False
 ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=["*"])
 
+DATABASES["default"].setdefault("OPTIONS", {})
+DATABASES["default"]["OPTIONS"]["sslmode"] = env("DB_SSLMODE", default="require")
+
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SECURE_SSL_REDIRECT = True
 SESSION_COOKIE_SECURE = True

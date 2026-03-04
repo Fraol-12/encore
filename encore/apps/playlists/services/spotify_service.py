@@ -88,10 +88,10 @@ class SpotifyService:
             "description": (description or "")[:300],
             "public": public,
         }
-        # `/me/playlists` avoids user-id mismatch and is the recommended endpoint.
+        # February 2026 Web API: POST /users/{user_id}/playlists removed.
         path = "/me/playlists"
         if spotify_user_id:
-            path = f"/users/{spotify_user_id}/playlists"
+            logger.debug("Ignoring spotify_user_id and using /me/playlists for playlist creation.")
         return self._request(
             "POST",
             path,
@@ -106,29 +106,45 @@ class SpotifyService:
         }
         self._request("PUT", f"/playlists/{playlist_id}", expected_status=(200,), payload=payload)
 
+    @staticmethod
+    def _extract_playlist_item_uri(item_entry: dict | None) -> str | None:
+        if not isinstance(item_entry, dict):
+            return None
+        direct_uri = item_entry.get("uri")
+        if direct_uri:
+            return direct_uri
+        nested = item_entry.get("item") or item_entry.get("track")
+        if isinstance(nested, dict):
+            return nested.get("uri")
+        return None
+
     def get_playlist_track_uris(self, playlist_id: str) -> list[str]:
-        uris: list[str] = []
-        offset = 0
+        try:    
 
-        while True:
-            data = self._request(
-                "GET",
-                f"/playlists/{playlist_id}/tracks",
-                params={"fields": "items(track(uri)),total,next", "limit": 100, "offset": offset},
-            )
+            uris: list[str] = []
+            offset = 0
 
-            items = data.get("items", []) if data else []
-            for item in items:
-                track = item.get("track") or {}
-                uri = track.get("uri")
-                if uri:
-                    uris.append(uri)
+            while True:
+                data = self._request(
+                    "GET",
+                    f"/playlists/{playlist_id}/items",
+                    params={"limit": 100, "offset": offset},
+                )
 
-            if not data or not data.get("next"):
-                break
-            offset += 100
+                items = data.get("items", []) if data else []
+                for item in items:
+                    uri = self._extract_playlist_item_uri(item)
+                    if uri:
+                        uris.append(uri)
 
-        return uris
+                if not data or not data.get("next"):
+                    break
+                offset += 100
+
+            return uris
+        except ForbiddenAPIError:
+            logger.warning("Could not read existing tracks (403). Assuming empty playlist for smart_diff.")
+            return []  # fallback: treat as empty → just append
 
     def add_tracks(self, playlist_id: str, uris: list[str]) -> int:
         if not uris:
@@ -137,29 +153,78 @@ class SpotifyService:
         added = 0
         for i in range(0, len(uris), 100):
             chunk = uris[i : i + 100]
-            self._request(
-                "POST",
-                f"/playlists/{playlist_id}/tracks",
-                expected_status=(201,),
-                payload={"uris": chunk},
-            )
+            try:
+                self._request(
+                    "POST",
+                    f"/playlists/{playlist_id}/items",
+                    expected_status=(201,),
+                    payload={"uris": chunk},
+                )
+            except RuntimeError:
+                # Compatibility fallback if endpoint expects explicit item objects.
+                self._request(
+                    "POST",
+                    f"/playlists/{playlist_id}/items",
+                    expected_status=(201,),
+                    payload={"items": [{"uri": uri} for uri in chunk]},
+                )
             added += len(chunk)
         return added
+
+    def add_tracks_best_effort(self, playlist_id: str, uris: list[str]) -> tuple[int, list[str]]:
+        """
+        Try adding one track at a time and skip forbidden tracks.
+        Useful when only a subset of matched URIs is not addable for this account/market.
+        """
+        if not uris:
+            return 0, []
+
+        added = 0
+        denied: list[str] = []
+        for uri in uris:
+            try:
+                try:
+                    self._request(
+                        "POST",
+                        f"/playlists/{playlist_id}/items",
+                        expected_status=(201,),
+                        payload={"uris": [uri]},
+                    )
+                except RuntimeError:
+                    self._request(
+                        "POST",
+                        f"/playlists/{playlist_id}/items",
+                        expected_status=(201,),
+                        payload={"items": [{"uri": uri}]},
+                    )
+                added += 1
+            except ForbiddenAPIError:
+                denied.append(uri)
+        return added, denied
 
     def remove_tracks(self, playlist_id: str, uris: list[str]) -> int:
         if not uris:
             return 0
 
         removed = 0
-        # Spotify remove endpoint supports up to 100 objects per request.
+        # Remove endpoint supports up to 100 objects per request.
         for i in range(0, len(uris), 100):
             chunk = uris[i : i + 100]
-            tracks = [{"uri": uri} for uri in chunk]
-            self._request(
-                "DELETE",
-                f"/playlists/{playlist_id}/tracks",
-                expected_status=(200,),
-                payload={"tracks": tracks},
-            )
+            items = [{"uri": uri} for uri in chunk]
+            try:
+                self._request(
+                    "DELETE",
+                    f"/playlists/{playlist_id}/items",
+                    expected_status=(200, 204),
+                    payload={"items": items},
+                )
+            except RuntimeError:
+                # Backward-compatible fallback.
+                self._request(
+                    "DELETE",
+                    f"/playlists/{playlist_id}/items",
+                    expected_status=(200, 204),
+                    payload={"tracks": items},
+                )
             removed += len(chunk)
         return removed

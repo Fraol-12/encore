@@ -1,10 +1,70 @@
 import logging
 import re
 import time
+from difflib import SequenceMatcher
 
 import requests
 from django.conf import settings
-from rapidfuzz import fuzz
+try:
+    from rapidfuzz import fuzz  # type: ignore
+except ModuleNotFoundError:
+    class _FuzzFallback:
+        @staticmethod
+        def ratio(a: str, b: str) -> float:
+            if not a and not b:
+                return 100.0
+            if not a or not b:
+                return 0.0
+            return SequenceMatcher(None, a, b).ratio() * 100.0
+
+        @staticmethod
+        def partial_ratio(a: str, b: str) -> float:
+            if not a and not b:
+                return 100.0
+            if not a or not b:
+                return 0.0
+            if len(a) > len(b):
+                a, b = b, a
+            if a in b:
+                return 100.0
+
+            window = len(a)
+            best = 0.0
+            for idx in range(len(b) - window + 1):
+                candidate = b[idx : idx + window]
+                score = SequenceMatcher(None, a, candidate).ratio() * 100.0
+                if score > best:
+                    best = score
+                    if best >= 99.9:
+                        break
+            return best
+
+        @staticmethod
+        def token_set_ratio(a: str, b: str) -> float:
+            tokens_a = set(re.findall(r"\w+", a.lower()))
+            tokens_b = set(re.findall(r"\w+", b.lower()))
+            if not tokens_a and not tokens_b:
+                return 100.0
+            if not tokens_a or not tokens_b:
+                return 0.0
+
+            shared = sorted(tokens_a & tokens_b)
+            only_a = sorted(tokens_a - tokens_b)
+            only_b = sorted(tokens_b - tokens_a)
+
+            shared_text = " ".join(shared)
+            if not shared_text:
+                return _FuzzFallback.ratio(" ".join(sorted(tokens_a)), " ".join(sorted(tokens_b)))
+
+            left = " ".join(shared + only_a)
+            right = " ".join(shared + only_b)
+            return max(
+                _FuzzFallback.ratio(shared_text, left),
+                _FuzzFallback.ratio(shared_text, right),
+                _FuzzFallback.ratio(left, right),
+            )
+
+    fuzz = _FuzzFallback()
 
 
 from apps.playlists.models import PlaylistItem, TrackMatch
@@ -52,11 +112,13 @@ class SpotifyMatchingService:
     MAX_RATE_LIMIT_COOLDOWN_CAP = 86400.0
     DEFAULT_MAX_RATE_LIMIT_COOLDOWN = 300.0
 
-    def __init__(self, access_token: str):
+    def __init__(self, access_token: str, market: str | None = None):
         self.headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         }
+        normalized_market = (market or "").strip().upper()
+        self.market = normalized_market if len(normalized_market) == 2 else None
         configured_cooldown = getattr(
             settings,
             "SPOTIFY_RATE_LIMIT_MAX_COOLDOWN_SECONDS",
@@ -114,7 +176,9 @@ class SpotifyMatchingService:
         cleaned = re.sub(r"\s+-\s+", " - ", cleaned)
         return cleaned.strip(" -_")
 
-    def _guess_artist_and_title(self, cleaned: str, channel_title: str | None = None) -> tuple[str | None, str]:
+    def _guess_artist_and_title(
+        self, cleaned: str, channel_title: str | None = None
+    ) -> tuple[str | None, str, bool]:
         separators = [" - ", " – ", " — ", " | ", ": "]
         for sep in separators:
             if sep in cleaned:
@@ -122,7 +186,7 @@ class SpotifyMatchingService:
                 left = left.strip()
                 right = right.strip()
                 if left and right:
-                    return left, right
+                    return left, right, True
 
         lower_cleaned = cleaned.lower()
         if " by " in lower_cleaned:
@@ -130,13 +194,51 @@ class SpotifyMatchingService:
             title_guess = title_guess.strip()
             artist_guess = artist_guess.strip()
             if title_guess and artist_guess:
-                return artist_guess, title_guess
+                return artist_guess, title_guess, True
 
         artist_guess = channel_title.strip() if channel_title else None
-        return artist_guess, cleaned.strip()
+        return artist_guess, cleaned.strip(), False
+
+    def _build_title_variants(self, original_title: str, cleaned_title: str, title_guess: str) -> list[str]:
+        variants: list[str] = []
+        seen: set[str] = set()
+
+        def add_variant(value: str | None) -> None:
+            if not value:
+                return
+            normalized = re.sub(r"\s{2,}", " ", value).strip(" -_|:\"'")
+            if not normalized:
+                return
+            lowered = normalized.lower()
+            if lowered in seen:
+                return
+            seen.add(lowered)
+            variants.append(normalized)
+
+        add_variant(title_guess)
+        add_variant(cleaned_title)
+
+        # Quoted fragments are often the true song title in noisy YouTube titles.
+        for quoted in re.findall(r"[\"“]([^\"“”]{2,120})[\"”]", original_title or ""):
+            add_variant(quoted)
+
+        for candidate in (title_guess, cleaned_title):
+            stripped = re.sub(
+                r"\b(song|songs)\s+around\s+the\s+world\b.*$",
+                "",
+                candidate or "",
+                flags=re.IGNORECASE,
+            )
+            add_variant(stripped)
+
+        for segment in re.split(r"\s+\|\s+", cleaned_title or ""):
+            add_variant(segment)
+
+        return variants[:6]
 
     def search_spotify(self, query: str, limit: int = 10) -> list[dict]:
         """Search Spotify tracks with retry and rate-limit handling."""
+        limit = max(1, min(limit, 10))
 
         cache_key = (query, limit)
         cached = self._query_cache.get(cache_key)
@@ -159,10 +261,13 @@ class SpotifyMatchingService:
 
         def _search():
             self._wait_for_slot()
+            params = {"q": query, "type": "track", "limit": limit}
+            if self.market:
+                params["market"] = self.market
             resp = requests.get(
                 self.SEARCH_URL,
                 headers=self.headers,
-                params={"q": query, "type": "track", "limit": limit, "market": "US"},
+                params=params,
                 timeout=15,
             )
             if resp.status_code == 401:
@@ -278,7 +383,12 @@ class SpotifyMatchingService:
 
     def match_item(self, item: PlaylistItem) -> str | None:
         cleaned = self.clean_title(item.title)
-        artist_guess, title_guess = self._guess_artist_and_title(cleaned, item.channel_title)
+        artist_guess, title_guess, artist_guess_from_title = self._guess_artist_and_title(
+            cleaned, item.channel_title
+        )
+        score_artist_guess = artist_guess if artist_guess_from_title else None
+        title_variants = self._build_title_variants(item.title, cleaned, title_guess or cleaned)
+        title_for_scoring = title_variants[0] if title_variants else (title_guess or cleaned)
         existing_active = (
             TrackMatch.objects.filter(playlist_item=item, is_active=True)
             .order_by("-confidence_score", "-matched_at")
@@ -287,47 +397,58 @@ class SpotifyMatchingService:
 
         candidates: list[dict] = []
         search_unavailable = False
-        if title_guess:
-            query = f"track:{title_guess}"
+        best_score = 0.0
+        best_track = None
+
+        structured_queries: list[str] = []
+        if title_variants:
+            primary_title = title_variants[0]
             if artist_guess:
-                query += f" artist:{artist_guess}"
+                structured_queries.append(f"track:{primary_title} artist:{artist_guess}")
+            structured_queries.append(f"track:{primary_title}")
+            structured_queries.extend(f"track:{variant}" for variant in title_variants[1:4])
+
+        seen_queries: set[str] = set()
+        for query in structured_queries:
+            if query in seen_queries:
+                continue
+            seen_queries.add(query)
             try:
-                candidates = self.search_spotify(query, limit=10)
+                batch = self.search_spotify(query, limit=10)
+                if batch:
+                    candidates.extend(batch)
+                    best_score, best_track = self._iter_candidate_scores(
+                        title_guess=title_for_scoring,
+                        artist_guess=score_artist_guess,
+                        cleaned_title=cleaned,
+                        duration_seconds=item.duration_seconds,
+                        candidates=candidates,
+                    )
+                    if best_score >= 0.82:
+                        break
             except SpotifyRateLimited:
                 raise
             except SpotifySearchUnavailable as exc:
-                logger.warning("Primary Spotify search unavailable for playlist item %s: %s", item.id, exc)
+                logger.warning(
+                    "Spotify structured search unavailable for playlist item %s (query=%s): %s",
+                    item.id,
+                    query,
+                    exc,
+                )
                 search_unavailable = True
-
-        if not candidates and title_guess:
-            try:
-                candidates = self.search_spotify(title_guess, limit=10)
-            except SpotifyRateLimited:
-                raise
-            except SpotifySearchUnavailable as exc:
-                logger.warning("Fallback Spotify search unavailable for playlist item %s: %s", item.id, exc)
-                search_unavailable = True
-
-        best_score, best_track = self._iter_candidate_scores(
-            title_guess=title_guess or cleaned,
-            artist_guess=artist_guess,
-            cleaned_title=cleaned,
-            duration_seconds=item.duration_seconds,
-            candidates=candidates,
-        )
 
         if best_score < 0.75 and cleaned:
             broad_candidates = []
             try:
-                broad_candidates = self.search_spotify(cleaned, limit=15)
+                broad_candidates = self.search_spotify(cleaned, limit=10)
             except SpotifyRateLimited:
                 raise
             except SpotifySearchUnavailable as exc:
                 logger.warning("Broad Spotify search unavailable for playlist item %s: %s", item.id, exc)
                 search_unavailable = True
             broad_score, broad_track = self._iter_candidate_scores(
-                title_guess=title_guess or cleaned,
-                artist_guess=artist_guess,
+                title_guess=title_for_scoring,
+                artist_guess=score_artist_guess,
                 cleaned_title=cleaned,
                 duration_seconds=item.duration_seconds,
                 candidates=broad_candidates,
@@ -366,6 +487,8 @@ class SpotifyMatchingService:
                     "matching": {
                         "cleaned_title": cleaned,
                         "artist_guess": artist_guess,
+                        "artist_guess_source": "title" if artist_guess_from_title else "channel_or_unknown",
+                        "title_variants": title_variants,
                         "score": best_score,
                     },
                 },

@@ -46,7 +46,7 @@ class Playlist(models.Model):
     sync_mode = models.CharField(
         max_length=20,
         choices=SYNC_MODES,
-        default='smart_diff',
+        default='append_only',
         help_text="How to handle re-syncs"
     )
 

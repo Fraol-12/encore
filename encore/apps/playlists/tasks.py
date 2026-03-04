@@ -130,10 +130,11 @@ def process_sync(sync_operation_id: int):
         youtube_service = YouTubeService()
         source_summary = youtube_service.resync_playlist(playlist)
 
-        matcher = SpotifyMatchingService(account.access_token)
         spotify = SpotifyService(account.access_token)
         spotify_profile = spotify.get_current_user()
         current_spotify_user_id = spotify_profile.get("id")
+        spotify_market = (spotify_profile.get("country") or "").strip().upper() or None
+        matcher = SpotifyMatchingService(account.access_token, market=spotify_market)
         if current_spotify_user_id and current_spotify_user_id != account.spotify_user_id:
             account.spotify_user_id = current_spotify_user_id
             account.save(update_fields=["spotify_user_id", "updated_at"])
@@ -218,6 +219,7 @@ def process_sync(sync_operation_id: int):
                     "retry_after_seconds": int(math.ceil(rate_limit_retry_after_seconds)) if rate_limit_retry_after_seconds > 0 else 0,
                     "spotify_playlist_created_while_rate_limited": created_placeholder_playlist,
                     "spotify_playlist_id": playlist.spotify_playlist_id,
+                    "spotify_market": spotify_market,
                 },
             }
             with transaction.atomic():
@@ -293,17 +295,19 @@ def process_sync(sync_operation_id: int):
                 playlist.save(update_fields=["spotify_playlist_id", "spotify_playlist_uri", "updated_at"])
                 created_new_playlist = True
 
-        # Freshly created playlists are empty by definition.
-        if created_new_playlist:
-            existing_uris = []
+        # === FIXED SYNC LOGIC - RESPECTS append_only ===
+        if created_new_playlist or playlist.sync_mode == 'append_only':
+            existing_uris = []                     # append_only = just add, never remove
+            remove_uris = []
         else:
+            # smart_diff or full_replace
             try:
                 existing_uris = spotify.get_playlist_track_uris(playlist.spotify_playlist_id)
             except ForbiddenAPIError as exc:
                 logger.warning(
-                    "Unable to read Spotify playlist tracks for playlist=%s. Recreating a managed playlist. %s",
-                    playlist.spotify_playlist_id,
-                    exc,
+                    "Unable to read Spotify playlist tracks for playlist=%s. "
+                    "Recreating a managed playlist. %s",
+                    playlist.spotify_playlist_id, exc
                 )
                 created = spotify.create_playlist(
                     name=playlist.title,
@@ -315,34 +319,90 @@ def process_sync(sync_operation_id: int):
                 playlist.save(update_fields=["spotify_playlist_id", "spotify_playlist_uri", "updated_at"])
                 created_new_playlist = True
                 existing_uris = []
-                errors.append(
-                    {
-                        "spotify_playlist_read_warning": str(exc),
-                        "fallback": "recreated_managed_playlist",
-                    }
-                )
+                errors.append({"spotify_playlist_read_warning": str(exc), "fallback": "recreated_managed_playlist"})
 
         existing_set = set(existing_uris)
         desired_set = set(desired_uris)
 
         add_uris = [uri for uri in desired_uris if uri not in existing_set]
-        remove_uris: list[str] = []
+        remove_uris = []
 
-        if created_new_playlist:
-            remove_uris = []
-        elif playlist.sync_mode == "full_replace":
+        if playlist.sync_mode == "full_replace":
             remove_uris = [uri for uri in _unique_uris(existing_uris) if uri not in desired_set]
         elif playlist.sync_mode == "smart_diff":
             managed_uris = set(
-                TrackMatch.objects.filter(playlist_item__playlist=playlist).values_list("spotify_track_uri", flat=True)
+                TrackMatch.objects.filter(playlist_item__playlist=playlist)
+                .values_list("spotify_track_uri", flat=True)
             )
             remove_uris = [
                 uri for uri in _unique_uris(existing_uris)
                 if uri in managed_uris and uri not in desired_set
             ]
+        # append_only does nothing here - just adds
 
-        added_tracks = spotify.add_tracks(playlist.spotify_playlist_id, add_uris)
-        removed_tracks = spotify.remove_tracks(playlist.spotify_playlist_id, remove_uris)
+        def _recreate_managed_playlist(write_error: Exception) -> tuple[str | None, str | None]:
+            previous_playlist_id = playlist.spotify_playlist_id
+            created = spotify.create_playlist(
+                name=playlist.title,
+                description=playlist.description or "Imported by Encore",
+                public=False,
+            )
+            playlist.spotify_playlist_id = created.get("id")
+            playlist.spotify_playlist_uri = created.get("uri")
+            playlist.save(update_fields=["spotify_playlist_id", "spotify_playlist_uri", "updated_at"])
+            errors.append(
+                {
+                    "spotify_playlist_write_warning": str(write_error),
+                    "fallback": "recreated_managed_playlist",
+                    "previous_playlist_id": previous_playlist_id,
+                    "new_playlist_id": playlist.spotify_playlist_id,
+                }
+            )
+            return previous_playlist_id, playlist.spotify_playlist_id
+
+        try:
+            added_tracks = spotify.add_tracks(playlist.spotify_playlist_id, add_uris)
+            removed_tracks = spotify.remove_tracks(playlist.spotify_playlist_id, remove_uris)
+        except ForbiddenAPIError as exc:
+            logger.warning(
+                "Unable to write Spotify playlist=%s. Recreating managed playlist and retrying add. %s",
+                playlist.spotify_playlist_id,
+                exc,
+            )
+            old_id, new_id = _recreate_managed_playlist(exc)
+            add_uris = desired_uris
+            remove_uris = []
+            try:
+                added_tracks = spotify.add_tracks(playlist.spotify_playlist_id, add_uris)
+                removed_tracks = 0
+                logger.info(
+                    "Retried Spotify write after recreating playlist old=%s new=%s added=%s",
+                    old_id,
+                    new_id,
+                    added_tracks,
+                )
+            except ForbiddenAPIError as retry_exc:
+                added_tracks, denied_uris = spotify.add_tracks_best_effort(
+                    playlist.spotify_playlist_id,
+                    add_uris,
+                )
+                removed_tracks = 0
+                if added_tracks == 0:
+                    raise retry_exc
+                errors.append(
+                    {
+                        "spotify_playlist_write_warning": str(retry_exc),
+                        "fallback": "best_effort_add_tracks",
+                        "denied_uri_count": len(denied_uris),
+                    }
+                )
+                logger.warning(
+                    "Best-effort add after forbidden write old=%s new=%s added=%s denied=%s",
+                    old_id,
+                    new_id,
+                    added_tracks,
+                    len(denied_uris),
+                )
 
         with transaction.atomic():
             operation.status = "completed" if unmatched == 0 and not errors else "partial"
@@ -358,6 +418,7 @@ def process_sync(sync_operation_id: int):
                     "added_to_spotify": added_tracks,
                     "removed_from_spotify": removed_tracks,
                     "sync_mode": playlist.sync_mode,
+                    "spotify_market": spotify_market,
                 },
             }
             operation.ended_at = timezone.now()

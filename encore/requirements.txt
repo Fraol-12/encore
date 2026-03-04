@@ -50,6 +50,5 @@ gunicorn==23.0.0
 whitenoise==6.9.0
 django-fernet-fields
 requests-oauthlib
-rapidfuzz
 django-encrypted-model-fields
 isodate

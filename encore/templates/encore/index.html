@@ -91,10 +91,6 @@
     })();
   </script>
 
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  {% if debug %}
   <script>
     tailwind = window.tailwind || {};
     tailwind.config = {
@@ -112,9 +108,9 @@
     };
   </script>
   <script src="https://cdn.tailwindcss.com"></script>
-  {% else %}
-  <link rel="stylesheet" href="{% static 'encore/css/tailwind.css' %}" />
-  {% endif %}
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="{% static 'encore/css/styles.css' %}" />
 </head>
 <body class="min-h-full bg-slate-100 text-slate-900 antialiased transition-colors dark:bg-slate-950 dark:text-slate-100">

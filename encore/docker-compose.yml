@@ -2,7 +2,9 @@ name: encore
 
 services:
   web:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     command: sh -c "python manage.py migrate && python manage.py collectstatic --noinput && gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3"
     env_file:
       - .env
@@ -24,7 +26,9 @@ services:
       - encore_net
 
   celery:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     command: celery -A config worker -l info
     env_file:
       - .env

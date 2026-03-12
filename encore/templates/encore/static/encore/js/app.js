@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const API_BASE_URL = window.ENCORE_API_BASE_URL || "http://127.0.0.1:8000";
+  const API_BASE_URL = window.ENCORE_API_BASE_URL || window.location.origin;
   const ACCESS_TOKEN_KEY = "encore_access_token";
   const REFRESH_TOKEN_KEY = "encore_refresh_token";
   const THEME_KEY = "encore_theme";

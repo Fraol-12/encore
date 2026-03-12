@@ -1,0 +1,8 @@
+{
+  "name": "encore-frontend",
+  "private": true,
+  "devDependencies": {
+    "@tailwindcss/line-clamp": "^0.4.4",
+    "tailwindcss": "^3.4.17"
+  }
+}

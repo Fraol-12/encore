@@ -8,15 +8,85 @@
 
   <script>
     (function () {
+      const THEME_KEY = "encore_theme";
+      const root = document.documentElement;
+      const sunIconPath = `<path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m8.66-10h-1M4.34 12h-1m15.02 6.36-.7-.7M6.02 6.02l-.7-.7m12.72 0-.7.7M6.02 17.98l-.7.7M12 8a4 4 0 100 8 4 4 0 000-8z" />`;
+      const moonIconPath = `<path stroke-linecap="round" stroke-linejoin="round" d="M21 12.79A9 9 0 1111.21 3c.11 0 .22.01.33.02a1 1 0 01.52 1.8A7 7 0 0018.2 12a7 7 0 00-.52 2.64 1 1 0 01-1.77.62 9.03 9.03 0 01-1.91-2.47 9.03 9.03 0 01-2.47-1.91 1 1 0 01.62-1.77A7 7 0 0012 5.8 7 7 0 005.2 12a7 7 0 007 7 7 7 0 006.18-3.77 1 1 0 011.77.58c.02.11.03.22.03.33z" />`;
+
+      let mode = null;
       try {
-        const saved = localStorage.getItem("encore_theme");
-        const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-        const useDark = saved ? saved === "dark" : prefersDark;
-        if (useDark) {
-          document.documentElement.classList.add("dark");
-        }
+        mode = localStorage.getItem(THEME_KEY);
       } catch (_err) {
-        // Ignore theme boot errors.
+        mode = null;
+      }
+
+      if (mode !== "dark" && mode !== "light") {
+        const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+        mode = prefersDark ? "dark" : "light";
+      }
+
+      function applyTheme(nextMode, persist) {
+        const normalizedMode = nextMode === "dark" ? "dark" : "light";
+        const isDark = normalizedMode === "dark";
+
+        root.classList.toggle("dark", isDark);
+        root.style.colorScheme = normalizedMode;
+        if (document.body) {
+          document.body.classList.toggle("dark", isDark);
+        }
+
+        if (persist !== false) {
+          try {
+            localStorage.setItem(THEME_KEY, normalizedMode);
+          } catch (_err) {
+            // Ignore storage errors.
+          }
+        }
+
+        const label = document.getElementById("theme-label");
+        if (label) {
+          label.textContent = isDark ? "Dark" : "Light";
+        }
+
+        const icon = document.getElementById("theme-icon");
+        if (icon) {
+          icon.innerHTML = isDark ? sunIconPath : moonIconPath;
+        }
+
+        const button = document.getElementById("theme-toggle-btn");
+        if (button) {
+          button.setAttribute("aria-pressed", String(isDark));
+          button.setAttribute("title", `Switch to ${isDark ? "light" : "dark"} mode`);
+        }
+      }
+
+      function bindThemeToggle() {
+        const button = document.getElementById("theme-toggle-btn");
+        if (!button || button.dataset.themeBound === "1") {
+          return;
+        }
+
+        button.dataset.themeBound = "1";
+        button.setAttribute("type", "button");
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          const isDark = root.classList.contains("dark");
+          applyTheme(isDark ? "light" : "dark", true);
+        }, true);
+
+        applyTheme(root.classList.contains("dark") ? "dark" : "light", false);
+      }
+
+      applyTheme(mode, false);
+      window.__encoreThemeManaged = true;
+      window.__encoreApplyTheme = applyTheme;
+      window.__encoreBindThemeToggle = bindThemeToggle;
+
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", bindThemeToggle, { once: true });
+      } else {
+        bindThemeToggle();
       }
     })();
   </script>
@@ -63,7 +133,7 @@
       </div>
 
       <div class="flex items-center gap-2">
-        <button id="theme-toggle-btn" class="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800">
+        <button id="theme-toggle-btn" type="button" class="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800">
           <svg id="theme-icon" xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"></svg>
           <span id="theme-label">Theme</span>
         </button>

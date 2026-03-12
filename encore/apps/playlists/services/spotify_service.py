@@ -83,15 +83,21 @@ class SpotifyService:
         public: bool = False,
         spotify_user_id: str | None = None,
     ) -> dict:
+        """Create a new Spotify playlist with safe name length (max 100 chars)."""
+        # Safe truncation - Spotify enforces 100 character limit
+        safe_name = str(name or "Encore Playlist")[:100].strip()
+        if len(str(name or "")) > 100:
+            safe_name = safe_name[:97] + "..."
+
         payload = {
-            "name": name[:100] if name else "Encore Playlist",
+            "name": safe_name,
             "description": (description or "")[:300],
             "public": public,
         }
-        # February 2026 Web API: POST /users/{user_id}/playlists removed.
+
+        # Always use /me/playlists - it's more reliable and recommended by Spotify
         path = "/me/playlists"
-        if spotify_user_id:
-            logger.debug("Ignoring spotify_user_id and using /me/playlists for playlist creation.")
+
         return self._request(
             "POST",
             path,
@@ -99,12 +105,24 @@ class SpotifyService:
             payload=payload,
         )
 
+
     def update_playlist(self, playlist_id: str, name: str, description: str = "") -> None:
+        """Update existing playlist with safe name length."""
+        safe_name = str(name or "Encore Playlist")[:100].strip()
+        if len(str(name or "")) > 100:
+            safe_name = safe_name[:97] + "..."
+
         payload = {
-            "name": name[:100] if name else "Encore Playlist",
+            "name": safe_name,
             "description": (description or "")[:300],
         }
-        self._request("PUT", f"/playlists/{playlist_id}", expected_status=(200,), payload=payload)
+
+        self._request(
+            "PUT",
+            f"/playlists/{playlist_id}",
+            expected_status=(200,),
+            payload=payload,
+        )
 
     @staticmethod
     def _extract_playlist_item_uri(item_entry: dict | None) -> str | None:

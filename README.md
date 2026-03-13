@@ -1,6 +1,7 @@
 # Encore Backend API
 
 Production-focused Django/DRF backend for importing public YouTube playlists, matching to Spotify tracks, and syncing to Spotify playlists.
+![Visual overview: playlist import, smart sync modes, and effortless multi-playlist management.](assets/image.png)
 
 ## Features
 - JWT auth (`/api/token/`, `/api/token/refresh/`)
